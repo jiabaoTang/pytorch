@@ -6,7 +6,7 @@
 
 // Determine if the architecture supports rowwise scaled mm
 // Currenlty failing on windows with: https://github.com/NVIDIA/cutlass/issues/1571
-#if !defined(USE_ROCM) && !defined(_WIN32) && defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+#if !defined(USE_ROCM) && !defined(_WIN32) && defined(CUDA_VERSION) && CUDA_VERSION > 12000
 
 #define BUILD_ROWWISE_FP8_KERNEL
 #endif
@@ -174,7 +174,7 @@ void f8f8bf16_rowwise_impl(
 
   // Implement rowwise scaling epilogue.
   constexpr int ColBroadcastStages = 0;
-  constexpr int RowBroadcastStages = PingPong::value ? 2 : 1;
+  constexpr int RowBroadcastStages = 0;
 
   using XScale = cutlass::epilogue::fusion::
       Sm90ColBroadcast<ColBroadcastStages, TileShape, DtypeScale>;
@@ -191,15 +191,7 @@ void f8f8bf16_rowwise_impl(
 
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
-  using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
-      Cast,
-      cutlass::epilogue::fusion::Sm90EVT<
-          Add,
-          Bias,
-          cutlass::epilogue::fusion::Sm90EVT<
-              Multiply,
-              XScale,
-              cutlass::epilogue::fusion::Sm90EVT<Multiply, WScale, Accum>>>>;
+  using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<Cast, cutlass::epilogue::fusion::Sm90EVT<Add, Bias, cutlass::epilogue::fusion::Sm90EVT<Multiply, WScale, cutlass::epilogue::fusion::Sm90EVT<Multiply, XScale, Accum>>>>;
 
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<

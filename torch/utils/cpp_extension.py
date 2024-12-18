@@ -16,6 +16,8 @@ import warnings
 import collections
 from pathlib import Path
 import errno
+from ctypes.util import find_library
+import functools
 
 import torch
 import torch._appdirs
@@ -142,19 +144,49 @@ def _find_rocm_home() -> Optional[str]:
     return rocm_home
 
 def _find_sycl_home() -> Optional[str]:
-    """Find the OneAPI install path."""
+    def valid_sycl_home(sycl_home):
+        libsycl = "sycl.lib" if IS_WINDOWS else "libsycl.so"
+        return os.path.exists(os.path.join(sycl_home, 'lib', libsycl))
+
+    sycl_home_from_env = os.environ.get('ONEAPI_ROOT')
+    icpx_path = shutil.which('icpx')
+    sycl_home = None
     # Guess #1
-    sycl_home = os.environ.get('ONEAPI_ROOT')
-    if sycl_home is None:
-        # Guess #2
-        icpx_path = shutil.which('icpx')
-        if icpx_path is not None:
-            sycl_home = os.path.dirname(os.path.dirname(
-                os.path.realpath(icpx_path)))
+    if sycl_home_from_env and valid_sycl_home(sycl_home_from_env):
+        sycl_home = sycl_home_from_env
+
+    # Guess #2
+    elif sycl_home_from_env:
+        new_sycl_home = os.path.join(sycl_home_from_env, 'compiler', 'latest')
+        if valid_sycl_home(new_sycl_home):
+            sycl_home = new_sycl_home
+
+    # Guess #3
+    elif icpx_path is not None:
+        sycl_home = os.path.dirname(os.path.dirname(
+            os.path.realpath(icpx_path)))
+
+    # Guess #4
+    else:
+        files = importlib.metadata.files('intel-sycl-rt') or []
+        for f in files:
+            if f.name == "libsycl.so":
+                sycl_home = os.path.dirname(Path(f.locate()).parent.resolve())
+                break
+
+    # Guess #5: find in default position.
+    if not sycl_home:
+        if IS_WINDOWS:
+            default_sycl_home = "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\latest\\"
+        else:
+            default_sycl_home = "/opt/intel/oneapi/compiler/latest"
+        if valid_sycl_home(default_sycl_home):
+            sycl_home = default_sycl_home
 
     if sycl_home and not torch.xpu.is_available():
         print(f"No XPU runtime is found, using ONEAPI_ROOT='{sycl_home}'",
               file=sys.stderr)
+
     return sycl_home
 
 def _join_rocm_home(*paths) -> str:
@@ -172,6 +204,11 @@ def _join_rocm_home(*paths) -> str:
                       'ROCm and Windows is not supported.')
     return os.path.join(ROCM_HOME, *paths)
 
+@functools.lru_cache(maxsize=1)
+def _is_level_zero_installed():
+    lib_path = find_library("ze_loader")
+    return True if lib_path else False
+
 def _join_sycl_home(*paths) -> str:
     """
     Join paths with SYCL_HOME, or raises an error if it SYCL_HOME is not set.
@@ -182,6 +219,10 @@ def _join_sycl_home(*paths) -> str:
     if SYCL_HOME is None:
         raise OSError('SYCL_HOME environment variable is not set. '
                       'Please set it to your OneAPI install root.')
+
+    # First check level_zero is installed which sycl depends on.
+    if not _is_level_zero_installed():
+        raise OSError('Level-zero runtime is not detected, please install it first.')
 
     return os.path.join(SYCL_HOME, *paths)
 
@@ -1235,6 +1276,7 @@ def include_paths(device_type: str = "cpu") -> List[str]:
             paths.append(os.path.join(CUDNN_HOME, 'include'))
     elif device_type == "xpu":
         paths.append(_join_sycl_home('include'))
+        paths.append(_join_sycl_home('include', 'sycl'))
     return paths
 
 

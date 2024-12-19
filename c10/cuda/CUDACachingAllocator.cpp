@@ -1,3 +1,16 @@
+// Copyright 2022 The GLake Authors. All rights reserved.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include <c10/core/impl/GPUTrace.h>
@@ -8,6 +21,10 @@
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/irange.h>
 #include <c10/util/llvmMathExtras.h>
+#include <c10/util/Backtrace.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <c10/cuda/cuda_vmm_allocator.h>
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -106,6 +123,7 @@ constexpr size_t kLargeBuffer =
 constexpr size_t kMinLargeAlloc =
     10485760; // allocations between 1 and 10 MiB may use kLargeBuffer
 constexpr size_t kRoundLarge = 2097152; // round up large allocations to 2 MiB
+constexpr size_t kGranularity   =  2097152; // round up large allocations to 2 MiB
 constexpr size_t kRoundUpPowerOfTwoIntervals = 16;
 
 namespace {
@@ -158,6 +176,146 @@ void update_stat_array(
       });
 }
 
+
+struct EventIDCounter
+{
+  EventIDCounter(cudaStream_t stream):stream(stream), current_event_id(0) {}
+    
+  void reset() {
+    std::lock_guard<std::recursive_mutex> lock(id_mutex);
+    current_event_id = 0;
+  }
+    
+  std::uint64_t next_id() {
+    std::lock_guard<std::recursive_mutex> lock(id_mutex);
+    
+    if(current_event_id == std::numeric_limits<uint64_t>::max())
+      current_event_id = 1;
+    else
+      current_event_id++;
+        
+      return current_event_id;
+  }
+    
+  std::recursive_mutex id_mutex;
+  cudaStream_t stream;
+  std::uint64_t current_event_id;
+};
+
+static std::unordered_map<cudaStream_t, std::shared_ptr<EventIDCounter>> stream_id_counter;
+static std::mutex counter_mutex;
+struct BlockEvent {
+  BlockEvent(cudaStream_t stream_in, bool record_event=false) {
+    stream = stream_in;
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    event_id = 0;
+    released = false;
+    ref_as_sync = false;
+    if(record_event) record(stream);
+    
+  }
+
+  void record(cudaStream_t stream_in) {
+
+    if(stream == stream_in)
+    {
+      std::shared_ptr<EventIDCounter> id_counter;
+      if(stream_id_counter.find(stream) == stream_id_counter.end()) {
+        id_counter = std::make_shared<EventIDCounter>(stream);
+        {
+          std::lock_guard<std::mutex> lock(counter_mutex);
+          stream_id_counter[stream] = id_counter;
+        }
+      } else {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        id_counter = stream_id_counter[stream];
+      }
+      
+      {
+        std::lock_guard<std::recursive_mutex> lock(id_counter->id_mutex);
+        
+        event_id = id_counter->next_id();
+        C10_CUDA_CHECK(cudaEventRecord(event, stream));
+      }
+    }
+  }
+
+  void release_resources()
+  {
+    if(!ref_as_sync) {
+      C10_CUDA_CHECK(cudaEventDestroy(event));
+    } else {
+      cudaError_t err = cudaEventQuery(event);
+      if(err == cudaSuccess) {
+        C10_CUDA_CHECK(cudaEventDestroy(event));
+      } else if(err == cudaErrorNotReady) {
+        cudaGetLastError();
+        event_gc(stream, event_id, event);
+      } else {
+        C10_CUDA_CHECK(err);
+        cudaGetLastError();
+        C10_CUDA_CHECK(cudaEventDestroy(event));
+      }
+    }
+  }
+
+  ~BlockEvent() {
+    if (!released) {
+      this->release_resources();
+      released = true;
+    }
+  }
+
+  static uint64_t create_id()
+  {
+    static std::atomic<std::uint64_t> current_event_id = {0};
+    static uint64_t id_max = std::numeric_limits<uint64_t>::max();
+
+    current_event_id.compare_exchange_strong(id_max, std::uint64_t(0));
+    uint64_t my_id = current_event_id.fetch_add(1);
+    
+    return my_id;
+  }
+
+  static void event_gc(cudaStream_t stream, uint64_t event_id, cudaEvent_t event)
+  {
+    using EventQueue=std::map<uint64_t, cudaEvent_t>;
+    
+    static std::unordered_map<cudaStream_t, EventQueue> event_pool;
+    static std::mutex pool_mutex;
+
+    {
+      std::lock_guard<std::mutex> lock(pool_mutex);
+      event_pool[stream][event_id] = event;
+    }
+    
+    auto& event_queue = event_pool.at(stream);
+    if(event_queue.size() > 2000)
+    {
+      std::lock_guard<std::mutex> lock(pool_mutex);
+
+      for(auto it = event_queue.begin(); it != std::prev(event_queue.end());) {
+        cudaEvent_t event = it->second;
+        cudaError_t err = cudaEventQuery(event);
+        if(err == cudaSuccess) {
+          C10_CUDA_CHECK(cudaEventDestroy(event));
+          it = event_queue.erase(it);
+        } else {
+          cudaGetLastError();
+          break;
+        }
+      }
+    }
+  }
+  
+  cudaStream_t stream;
+  cudaEvent_t event;
+  uint64_t event_id;
+  bool released;
+  bool ref_as_sync;
+};
+
+
 struct Block;
 struct PrivatePool;
 typedef bool (*Comparison)(const Block*, const Block*);
@@ -185,6 +343,7 @@ struct Block {
   stream_set stream_uses; // streams on which the block was used
   size_t size; // block size in bytes
   size_t requested_size; // memory originally requested
+  size_t actual_size;
   BlockPool* pool{nullptr}; // owning memory pool
   void* ptr{nullptr}; // memory address
   bool allocated{false}; // in-use flag
@@ -195,6 +354,8 @@ struct Block {
                    // garbage collection
   std::unique_ptr<HistoryChain> history;
   HistoryChain* history_last{nullptr};
+  std::shared_ptr<VmmSegment> vmm_segment;
+  std::shared_ptr<BlockEvent> self_last_event;
 
   Block(
       int device,
@@ -206,8 +367,10 @@ struct Block {
         stream(stream),
         stream_uses(),
         size(size),
+        actual_size(0),
         requested_size(0),
         pool(pool),
+        self_last_event(std::make_shared<BlockEvent>(stream)),
         ptr(ptr) {}
 
   // constructor for search key
@@ -216,6 +379,8 @@ struct Block {
         stream(stream),
         stream_uses(),
         size(size),
+        actual_size(0),
+        self_last_event(std::make_shared<BlockEvent>(stream)),
         requested_size(0) {}
 
   bool is_split() const {
@@ -232,6 +397,82 @@ static bool BlockComparator(const Block* a, const Block* b) {
   }
   return (uintptr_t)a->ptr < (uintptr_t)b->ptr;
 }
+
+struct BlockEventOrderComparator {
+  using BlockPtr=Block*;
+
+  bool operator()(const BlockPtr a, const BlockPtr b) const {
+    if(!a->self_last_event && !b->self_last_event) {
+      if(a->size != b->size) {
+        return a->size < b->size;
+      }
+  
+      return (uintptr_t)a->ptr < (uintptr_t)b->ptr;
+    }
+    
+    if(!a->self_last_event) {
+      return true;
+    }
+  
+    if(!b->self_last_event) {
+      return false;
+    }
+
+
+    if(a->self_last_event->event_id != b->self_last_event->event_id) {
+        return a->self_last_event->event_id < b->self_last_event->event_id;
+    }
+
+    
+    if(a->size != b->size) {
+      return a->size < b->size;
+    }
+  
+    return (uintptr_t)a->ptr < (uintptr_t)b->ptr;
+  }
+};
+
+using EventOrderedBlockSet=std::set<Block*, BlockEventOrderComparator>;
+using SetIterator=EventOrderedBlockSet::iterator;
+
+struct BlockEventOrderPool
+{
+  BlockEventOrderPool():pool_size(0) {}
+    
+  void insert(Block* block) {
+    if(blocks.count(block) == 0) {
+      blocks.insert(block);
+      pool_size += block->size;
+    }
+  }
+    
+  bool erase(Block* block) {
+    if(blocks.count(block)) {
+      blocks.erase(block);
+      pool_size -= block->size;
+            
+      return true;
+    } else {
+      GMLAKE_INFO(" warning block %p, block ptr %p of size %lu not found in pool", block, block->ptr, block->size);
+      return false;
+    }
+  }
+
+  SetIterator erase(SetIterator it) {
+    if(blocks.count(*it)) {
+      pool_size -= (*it)->size;
+            
+      return blocks.erase(it);
+    } else {
+      GMLAKE_INFO(" warning block %p, block ptr %p of size %lu not found in pool", (*it), (*it)->ptr, (*it)->size);
+      return blocks.end();
+    }
+  }
+    
+    
+  EventOrderedBlockSet blocks;
+  size_t pool_size;
+};
 
 struct AllocParams {
   AllocParams(
@@ -707,12 +948,31 @@ class DeviceCachingAllocator {
   // unallocated cached blocks larger than 1 MB
   BlockPool large_blocks;
 
+    
+  // unallocated cached blocks larger than 64 MB
+  //BlockPool huge_blocks;
+
+  // fused blocks that has been mapped to fragment blocks in size order
+  BlockPool free_fused_blocks;
+  
+  // fused blocks that has been mapped to fragment blocks in release order
+  std::unordered_map<cudaStream_t, BlockEventOrderPool> free_fused_blocks_in_release_order;
+  
+  // fused blocks which is free, but it's phy_blocks are used by other block of my stream
+  std::unordered_map<cudaStream_t, BlockEventOrderPool> fragmented_free_fused_blocks;
+
   // unallocated cached blocks 1 MB or smaller
   BlockPool small_blocks;
 
   // allocated or in use by a stream. Holds all active allocations,
   // whether they came from graph_pools or one of the BlockPools above.
   ska::flat_hash_set<Block*> active_blocks;
+  
+    //active fused blocks
+  ska::flat_hash_set<Block*> active_fused_blocks;
+  
+  //active fused blocks to be garbage collected
+  ska::flat_hash_set<Block*> active_fused_blocks_to_gc;
 
   // captures_underway tracks if a capture might be underway on any stream.
   // Most of the time it's zero, in which case malloc can avoid calling
@@ -728,6 +988,8 @@ class DeviceCachingAllocator {
 
   // record used memory.
   size_t total_allocated_memory = 0;
+
+  size_t total_fuse_size = 0;
 
   size_t allowed_memory_maximum = 0;
 
@@ -765,6 +1027,7 @@ class DeviceCachingAllocator {
  public:
   DeviceCachingAllocator()
       : large_blocks(BlockComparator, /*is_small=*/false),
+        free_fused_blocks(BlockComparator, /*is_small=*/false),
         small_blocks(BlockComparator, /*is_small=*/true),
         alloc_trace(new std::vector<TraceEntry>()) {
     stats.max_split_size = CachingAllocatorConfig::max_split_size();
@@ -826,7 +1089,8 @@ class DeviceCachingAllocator {
         // Search pool
         get_free_block(params)
         // Trigger callbacks and retry search
-        || (trigger_free_memory_callbacks(params) && get_free_block(params));
+        || (trigger_free_memory_callbacks(params) && get_free_block(params))
+        || get_fused_fragmented_blocks(params, 0);
 
     // Can't reuse an existing block; try to get a new one.
     if (!block_found) {
@@ -837,14 +1101,18 @@ class DeviceCachingAllocator {
         garbage_collect_cached_blocks();
       }
       // Attempt allocate
-      block_found = alloc_block(params, false)
+      block_found = //alloc_block(params, false)
+             realloc_block(params, false)
           // Free enough available cached blocks to satisfy alloc and retry
           // alloc.
           || (release_available_cached_blocks(params) &&
-              alloc_block(params, false))
+              realloc_block(params, false))
+          || get_fused_fragmented_blocks(params, 1)
           // Free all non-split cached blocks and retry alloc.
           || (C10_LIKELY(captures_underway == 0) && release_cached_blocks() &&
-              alloc_block(params, true));
+              realloc_block(params, true))
+          || get_fused_fragmented_blocks(params, 2);
+
       if (record_history && block_found) {
         record_trace(
             TraceEntry::SEGMENT_ALLOC,
@@ -878,6 +1146,9 @@ class DeviceCachingAllocator {
             std::move(context));
       }
       stats.num_ooms += 1;
+      GMLAKE_INFO(" current memory info: device_total: %luMB, device_free: %luMB, request size: %luMB",
+                                                                      device_total/(1024*1024), device_free/(1024*1024), size/(1024*1024));
+      print_snapshot();
 
       c10::reportOutOfMemoryToProfiler(
           size,
@@ -942,42 +1213,262 @@ class DeviceCachingAllocator {
     Block* block = params.block;
     Block* remaining = nullptr;
 
+    static const int vmmDefragment = ([]()->int{
+      const char* env = getenv("vmmDefragment");
+      if(env) return atoi(env);
+      else return 1;
+    })();
+
     const bool already_split = block->is_split();
     if (should_split(block, size)) {
-      remaining = block;
-
-      block = new Block(device, stream, size, &pool, block->ptr);
-      block->prev = remaining->prev;
-      if (block->prev) {
-        block->prev->next = block;
+      if(pool.is_small || vmmDefragment <= 0 || (block->vmm_segment && !block->vmm_segment->fused)) {
+        
+        remaining = block;
+          
+        block = new Block(device, stream, size, &pool, block->ptr);
+        block->prev = remaining->prev;
+        if (block->prev) {
+          block->prev->next = block;
+        }
+        block->next = remaining;
+          
+        remaining->prev = block;
+        remaining->ptr = static_cast<char*>(remaining->ptr) + size;
+        remaining->size -= size;
+          
+        if(vmmDefragment > 0 && remaining->vmm_segment) {
+              
+          auto remaining_segment = remaining->vmm_segment->split(size);
+          block->vmm_segment = std::move(remaining->vmm_segment);
+          remaining->vmm_segment =  std::move(remaining_segment);
+          
+              
+          size_t offset = 0;
+          for(auto& phy_block : block->vmm_segment->phy_blocks) {
+            phy_block->mapped_blocks[0].block = block;
+            phy_block->mapped_blocks[0].offset = offset;
+            phy_block->free = false;
+            offset++;
+          }
+          block->vmm_segment->free_blocks = 0;
+          block->vmm_segment->used_blocks = block->vmm_segment->phy_blocks.size();
+              
+              
+          offset = 0;
+          for(auto& phy_block : remaining->vmm_segment->phy_blocks) {
+            phy_block->mapped_blocks[0].block = remaining;
+            phy_block->mapped_blocks[0].offset = offset;
+                  
+            bool is_prev_free = phy_block->free;
+            phy_block->free = true;
+                  
+            //neglect the the first block, since it is the remaining block
+            for(int i=1; i<phy_block->mapped_blocks.size(); i++) {
+              Block* other_block = phy_block->mapped_blocks[i].block;
+                      
+                      
+              if(!is_prev_free) {
+                other_block->vmm_segment->free_blocks++;
+                        
+                if(other_block->vmm_segment->fused) {
+                  if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size()) {
+                    if(other_block->stream == block->stream &&
+                      fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
+                      fragmented_free_fused_blocks[other_block->stream].erase(other_block);
+                                      
+                      free_fused_blocks.blocks.insert(other_block);
+                      free_fused_blocks_in_release_order[other_block->stream].insert(other_block);
+                    }
+                  }
+                }           
+              }            
+            }
+                  
+            offset++;
+          }
+          remaining->vmm_segment->free_blocks = remaining->vmm_segment->phy_blocks.size();
+          remaining->vmm_segment->used_blocks = 0;
+        }
+          
+        bool inserted = pool.blocks.insert(remaining).second;
+        TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
+          
+        if (context) {
+          trimHistoryBefore(remaining, (char*)block->ptr + size);
+        }
+          
+        if (already_split) {
+          // An already-split inactive block is being shrunk by size bytes.
+          update_stat_array(
+            stats.inactive_split_bytes, -block->size, params.stat_types);
+        } else {
+          // A new split inactive block is being created from a previously unsplit
+          // block, size remaining->size bytes.
+          for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
+            update_stat(stats.inactive_split_bytes[stat_type], remaining->size);
+            update_stat(stats.inactive_split[stat_type], 1);
+          });
+        }
       }
-      block->next = remaining;
+      else if(vmmDefragment > 0 && block->vmm_segment) {
+        size_t keep_blocks = size/kGranularity;
+          
+        if(block->vmm_segment->used_blocks > keep_blocks) {
+          block->vmm_segment->free_blocks = block->vmm_segment->used_blocks - keep_blocks;
+          block->vmm_segment->used_blocks = keep_blocks;
+              
+          for(size_t i=0; i<keep_blocks; i++) {
+            if(block->vmm_segment->phy_blocks[i]->free) {
+              GMLAKE_INFO(" warning for malloc fused blocks has free phy_block, something wrong happended");
+              exit(-1);
+            }
+          }
+              
+          std::unordered_set<Block*> blocks2split;
+          for(size_t i = keep_blocks; i < block->vmm_segment->phy_blocks.size(); i++) {
+            auto& phy_block = block->vmm_segment->phy_blocks[i];
+                  
+            bool is_prev_free = phy_block->free;
+            phy_block->free = true;
+                  
+            for(auto& block_segment : phy_block->mapped_blocks) {
+              Block* other_block = block_segment.block;
+              
+              if(other_block == block) continue;
+                      
+              if(!is_prev_free) {
+                other_block->vmm_segment->free_blocks++;
+                if(other_block->vmm_segment->fused) {
+                  if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size()) {
+                    if(other_block->stream == block->stream &&
+                      fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
+                      fragmented_free_fused_blocks[other_block->stream].erase(other_block);
+                                      
+                      free_fused_blocks.blocks.insert(other_block);
+                      free_fused_blocks_in_release_order[other_block->stream].insert(other_block);
+                    }
+                  }
+                } else {
+                  if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size()) {
+                    large_blocks.blocks.insert(other_block);
+                                  
+                    blocks2split.erase(other_block);
+                    
+                    if(other_block->is_split()) {
+                      update_stat_array(stats.inactive_split, 1, params.stat_types);
+                      update_stat_array(stats.inactive_split_bytes, other_block->size, params.stat_types);
+                    }
+                  } else {
+                    if(blocks2split.count(other_block) == 0) {
+                      blocks2split.insert(other_block);
+                    }
+                  }
+                } 
+              }
+            }
+          }
+    
+          for(auto& block2split : blocks2split) {
+            if(block2split->vmm_segment->fused || 
+               block2split->vmm_segment->free_blocks == 0 || 
+               block2split->vmm_segment->free_blocks == block2split->vmm_segment->phy_blocks.size()) continue;
+                  
+                  
+            if(active_blocks.count(block2split)) {
+              block2split->allocated = false;
+              active_blocks.erase(block2split);
+                    
+              update_stat_array(stats.active, -1, params.stat_types);
+              update_stat_array(stats.active_bytes, -block2split->size, params.stat_types);
+            }
+                  
+                  
+            bool block_free = block2split->vmm_segment->phy_blocks[0]->free;          
+            size_t last_offset = 0;
+            Block* prev_block = block2split->prev;
+                  
+            auto phy_blocks = block2split->vmm_segment->phy_blocks;
+            auto vmm_segment = std::move(block2split->vmm_segment);
+                  
+            for(size_t i=1; i<=phy_blocks.size(); i++) {
+                      
+              if( i == phy_blocks.size() || block_free != phy_blocks[i]->free ) {
+                size_t block_size = (i - last_offset)*kGranularity;
+                          
+                char* block_ptr = (char*)block2split->ptr + last_offset*kGranularity;
+                Block* split_block = new Block(device, stream, block_size, &pool, block_ptr);
+                          
+                          
+                split_block->prev = prev_block;
+                if(prev_block) prev_block->next = split_block;
+            
+                split_block->self_last_event = block2split->self_last_event;
+                          
+                          
+                if(i < phy_blocks.size()) {
+                  auto remaining_segment = vmm_segment->split(block_size);
+                  split_block->vmm_segment = std::move(vmm_segment);
+                  vmm_segment = std::move(remaining_segment);
+                } else {
+                  split_block->vmm_segment = std::move(vmm_segment);
+                }
+                          
+                          
+                size_t offset = 0;
+                for(auto& phy_block : split_block->vmm_segment->phy_blocks) {
+                  phy_block->mapped_blocks[0].block = split_block;
+                  phy_block->mapped_blocks[0].offset = offset;
+                  offset++;
+                }
+                          
+            
+                if(block_free) {
+                  split_block->vmm_segment->free_blocks = split_block->vmm_segment->phy_blocks.size();
+                  split_block->vmm_segment->used_blocks = 0;
+              
+                  large_blocks.blocks.insert(split_block);
+              
+                  update_stat_array(stats.inactive_split, 1, params.stat_types);
+                  update_stat_array(stats.inactive_split_bytes, split_block->size, params.stat_types);
+                } else {
+                  split_block->vmm_segment->free_blocks = 0;
+                  split_block->vmm_segment->used_blocks = 0;
+                              
+                  split_block->allocated = true;
+                  active_blocks.insert(split_block);
+                              
+                              
+                  update_stat_array(stats.active, 1, params.stat_types);
+                  update_stat_array(stats.active_bytes, split_block->size, params.stat_types);
+                }
+                   
 
-      remaining->prev = block;
-      remaining->ptr = static_cast<char*>(remaining->ptr) + size;
-      remaining->size -= size;
-      bool inserted = pool.blocks.insert(remaining).second;
-      TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
+                if(i < phy_blocks.size()) {
+                  block_free = phy_blocks[i]->free;
+                }
+                last_offset = i;
+                prev_block = split_block;
+              }
+            }
+                  
+                  
+            if(prev_block) {
+              prev_block->next = block2split->next;
+            }
+                  
+            if(block2split->next) {
+              block2split->next->prev = prev_block;
+            }
+                  
+                  
+            delete block2split;
+          }
+        }
+      }
+
 
       if (record_history) {
         trimHistoryBefore(remaining, (char*)block->ptr + size);
-      }
-
-      if (already_split) {
-        // An already-split inactive block is being shrunk by size bytes.
-        update_stat_array(
-            stats.inactive_split_bytes,
-            -static_cast<std::int64_t>(block->size),
-            params.stat_types);
-      } else {
-        // A new split inactive block is being created from a previously unsplit
-        // block, size remaining->size bytes.
-        for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
-          update_stat(
-              stats.inactive_split_bytes[stat_type],
-              static_cast<std::int64_t>(remaining->size));
-          update_stat(stats.inactive_split[stat_type], 1);
-        });
       }
 
     } else if (already_split) {
@@ -992,6 +1483,7 @@ class DeviceCachingAllocator {
 
     block->allocated = true;
     block->requested_size = orig_size;
+    block->actual_size = size;
     if (record_history) {
       trimHistoryBefore(block, (char*)block->ptr + size);
       block->history = std::make_unique<HistoryChain>(HistoryChain{
@@ -1008,21 +1500,27 @@ class DeviceCachingAllocator {
           block->history->h.context);
     }
 
-    bool inserted = active_blocks.insert(block).second;
-    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
+    bool inserted = false;
+    if(block->vmm_segment && block->vmm_segment->fused) {
+        active_fused_blocks.insert(block);
+    } else {
+        inserted = active_blocks.insert(block).second;
+        TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
+    }
 
     for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
       update_stat(stats.allocation[stat_type], 1);
       update_stat(
           stats.allocated_bytes[stat_type],
-          static_cast<std::int64_t>(block->size));
-      update_stat(stats.active[stat_type], 1);
-      update_stat(
-          stats.active_bytes[stat_type],
-          static_cast<std::int64_t>(block->size));
+          static_cast<std::int64_t>(block->actual_size));
       update_stat(
           stats.requested_bytes[stat_type],
           static_cast<std::int64_t>(block->requested_size));
+          if (inserted)
+          {
+              update_stat(stats.active[stat_type], 1);
+              update_stat(stats.active_bytes[stat_type], block->size);
+          }
     });
     if (block->size >= CachingAllocatorConfig::max_split_size())
       update_stat(stats.oversize_allocations, 1);
@@ -1055,7 +1553,7 @@ class DeviceCachingAllocator {
       update_stat(stats.allocation[stat_type], -1);
       update_stat(
           stats.allocated_bytes[stat_type],
-          -static_cast<std::int64_t>(block->size));
+          -static_cast<std::int64_t>(block->actual_size));
     });
     if (block->history) {
       record_trace(
@@ -1079,7 +1577,9 @@ class DeviceCachingAllocator {
         insert_events(block);
       }
     } else {
-      free_block(block);
+      // free_block(block);
+      insert_free_event_into_alloc_stream(block);   
+      update_block(block);
     }
 
     c10::reportMemoryUsageToProfiler(
@@ -1088,6 +1588,127 @@ class DeviceCachingAllocator {
         stats.allocated_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         c10::Device(c10::DeviceType::CUDA, block->device));
+  }
+
+  void update_block(Block* block) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    bool flag = false;
+      
+    std::unordered_set<Block*> blocks2free;
+    if(block->vmm_segment) {
+          
+      for(size_t i=0; i<block->vmm_segment->phy_blocks.size(); i++) {
+              
+        if(i < block->vmm_segment->used_blocks) {
+          auto& phy_block = block->vmm_segment->phy_blocks[i];
+              
+          bool is_prev_free = phy_block->free;
+          if(!is_prev_free) {
+            block->vmm_segment->free_blocks++;
+            phy_block->free = true;
+          } else {
+            GMLAKE_INFO(" warning used blocks is free");
+            exit(-1);
+          }
+                  
+          for(auto& block_segment : phy_block->mapped_blocks) {
+            Block* other_block = block_segment.block;
+                      
+            if(other_block == block) continue;
+                      
+            if(!is_prev_free) {
+              other_block->vmm_segment->free_blocks++;
+                          
+              if(other_block->vmm_segment->fused) {
+                if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size()) {
+                  if(other_block->stream == block->stream &&
+                    fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
+                    fragmented_free_fused_blocks[other_block->stream].erase(other_block);
+                                      
+                    free_fused_blocks.blocks.insert(other_block);
+                    free_fused_blocks_in_release_order[other_block->stream].insert(other_block);
+                  }
+                }
+              } else {
+                if(!other_block->self_last_event ||
+                    other_block->self_last_event->event_id < block->self_last_event->event_id) {
+                    other_block->self_last_event = block->self_last_event;
+                }
+                              
+                if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size()) {
+                  blocks2free.insert(other_block);
+                }
+              }
+                          
+            }
+          }
+        }
+      }
+          
+      block->vmm_segment->used_blocks = 0;
+          
+    }
+      
+      
+    if(block->vmm_segment && block->vmm_segment->fused) {
+      if(active_fused_blocks_to_gc.count(block) == 0) {
+        if(block->vmm_segment->free_blocks == block->vmm_segment->phy_blocks.size()) {
+          if(fragmented_free_fused_blocks[block->stream].blocks.count(block)) {
+            fragmented_free_fused_blocks[block->stream].erase(block);
+          }
+                  
+          free_fused_blocks.blocks.insert(block);
+          free_fused_blocks_in_release_order[block->stream].insert(block);
+        } else {
+          fragmented_free_fused_blocks[block->stream].insert(block);
+        }
+      }
+
+          
+      if(active_fused_blocks.count(block)) {
+        block->allocated = false;
+        active_fused_blocks.erase(block);
+        flag = true;
+        size_t requested_size = block->requested_size;
+        StatTypes stat_types = {false};
+        stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
+        stat_types[static_cast<size_t>(get_stat_type_for_pool(large_blocks))] = true;
+        for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+          update_stat(
+            stats.requested_bytes[stat_type],
+            -static_cast<std::int64_t>(requested_size));
+        });
+              
+        if(active_fused_blocks_to_gc.count(block)) {
+          for(auto& phy_block : block->vmm_segment->phy_blocks) {
+            int i = 0;
+            for(int j = 0; j < phy_block->mapped_blocks.size(); j++) {
+              if(phy_block->mapped_blocks[j].block != block) {
+                if(i != j) {
+                  phy_block->mapped_blocks[i] = phy_block->mapped_blocks[j];
+                }
+                              
+                i++;
+              }
+            }
+            phy_block->mapped_blocks.resize(i);
+          }
+                  
+          active_fused_blocks_to_gc.erase(block);
+          delete block;
+        }
+      }
+    } else {
+      free_block(block, flag);
+    }
+      
+      
+    for(auto& block2free : blocks2free) {
+          
+      block2free->allocated = false;
+      free_block(block2free, flag);
+    }
+      
   }
 
   void* getBaseAllocation(Block* block, size_t* outSize) {
@@ -1130,6 +1751,11 @@ class DeviceCachingAllocator {
   void emptyCache() {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     release_cached_blocks();
+
+    size_t garbage_size = garbage_collect_fused_blocks(2, 0);
+    total_fuse_size -= garbage_size;
+	
+	  GMLAKE_INFO(" garbage_collect_fused_blocks() return %luMB garbage memory", garbage_size/(1024*1024));
   }
 
   /** Retrieves size of largest unused block held by the memory cache **/
@@ -1275,6 +1901,24 @@ class DeviceCachingAllocator {
     return result;
   }
 
+  void print_snapshot()
+  {
+    auto memory_snapshot = snapshot();
+      
+    for(auto& segment_info : memory_snapshot) {
+      if(segment_info.is_large) {
+        GMLAKE_INFO(" segment: %p, size: %luMB", (void*)segment_info.address, segment_info.total_size/(1024*1024));
+                    
+        for(auto& block_info : segment_info.blocks) {
+          GMLAKE_INFO(" %s %s block, size: %luMB", 
+                     (block_info.allocated? "allocated" : "unallocated"), 
+                     (block_info.active? "active" : "inactive"),
+                     block_info.size/(1024*1024) );
+        }
+      }
+    }
+  }
+
   // This function takes the size and number of divisions argument and rounds
   // up the size argument for the nearest power-of-2 division.
   // For example, if we need to round-up 1200 and number of divisions is 4,
@@ -1310,7 +1954,13 @@ class DeviceCachingAllocator {
       if (divisions > 0 && size > (kMinBlockSize * divisions)) {
         return roundup_power2_next_division(size, divisions);
       } else {
-        return kMinBlockSize * ((size + kMinBlockSize - 1) / kMinBlockSize);
+        // return kMinBlockSize * ((size + kMinBlockSize - 1) / kMinBlockSize);
+        size_t block_round_size = kMinBlockSize * ((size + kMinBlockSize - 1) / kMinBlockSize);
+        if(block_round_size > kSmallSize) //if block will alloc from large_blocks, round to 2M
+        {
+            block_round_size = kGranularity * ((size + kGranularity - 1) / kGranularity);
+        }
+        return block_round_size;
       }
     }
   }
@@ -1398,7 +2048,7 @@ class DeviceCachingAllocator {
   }
 
   /** moves a block into a pool of cached free blocks */
-  void free_block(Block* block) {
+  void free_block(Block* block, bool flag) {
     TORCH_INTERNAL_ASSERT(
         !block->allocated && block->event_count == 0 &&
         block->stream_uses.empty());
@@ -1410,6 +2060,12 @@ class DeviceCachingAllocator {
           block->stream,
           block->history->h.context);
     }
+    static const int vmmDefragment = ([]()->int{
+        const char* env = getenv("vmmDefragment");
+        if(env) return atoi(env);
+        else return 1;
+    })();
+
     size_t original_block_size = block->size;
     size_t requested_size = block->requested_size;
 
@@ -1433,6 +2089,12 @@ class DeviceCachingAllocator {
     bool inserted = pool.blocks.insert(block).second;
     TORCH_INTERNAL_ASSERT(inserted);
 
+    if(vmmDefragment > 0 && block->vmm_segment/*!pool.is_small*/) {
+      block->vmm_segment->free_blocks = block->vmm_segment->phy_blocks.size();
+      block->vmm_segment->used_blocks = 0;
+
+    }
+
     if (block->is_split()) {
       net_change_inactive_split_blocks += 1;
       net_change_inactive_split_size += block->size;
@@ -1451,9 +2113,11 @@ class DeviceCachingAllocator {
       update_stat(
           stats.active_bytes[stat_type],
           -static_cast<std::int64_t>(original_block_size));
+      if (!flag) {
       update_stat(
           stats.requested_bytes[stat_type],
           -static_cast<std::int64_t>(requested_size));
+      }
     });
   }
 
@@ -1496,10 +2160,39 @@ class DeviceCachingAllocator {
       }
       src->history_last = nullptr;
     }
+
+    std::shared_ptr<BlockEvent> current_self_last_event = src->self_last_event;
+    if(!current_self_last_event || (dst->self_last_event && dst->self_last_event->event_id > current_self_last_event->event_id)) {
+      current_self_last_event = dst->self_last_event;
+    }
+
     const size_t subsumed_size = src->size;
     dst->size += subsumed_size;
+    dst->self_last_event = current_self_last_event;
     auto erased = pool.blocks.erase(src);
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(erased == 1);
+    static const int vmmDefragment = ([]()->int{
+        const char* env = getenv("vmmDefragment");
+        if(env) return atoi(env);
+        else return 1;
+    })();
+
+
+    if(vmmDefragment > 0 && dst->vmm_segment) {
+      bool ret = dst->vmm_segment->remerge(*(src->vmm_segment));
+      if(!ret) {
+        GMLAKE_INFO(" merge block %p, ptr %p of size %fMB into block %p, ptr %p of size %fMB failed", 
+                    src, src->ptr, src->size/(1024.f*1024.f), dst, dst->ptr, dst->size/(1024.f*1024.f));
+      }
+      
+      size_t offset = 0;
+      for(auto& phy_block : dst->vmm_segment->phy_blocks) {
+          phy_block->mapped_blocks[0].block = dst;
+          phy_block->mapped_blocks[0].offset = offset;
+          offset++;
+      }
+    }
+
     delete src;
 
     return subsumed_size;
@@ -1549,7 +2242,7 @@ class DeviceCachingAllocator {
       return remaining >= kMinBlockSize;
     } else {
       return (size < CachingAllocatorConfig::max_split_size()) &&
-          (remaining > kSmallSize);
+             (remaining >= kGranularity);
     }
   }
 
@@ -1564,6 +2257,24 @@ class DeviceCachingAllocator {
   }
 
   bool get_free_block(AllocParams& p) {
+
+    static const int vmmDefragment = ([]()->int{
+        const char* env = getenv("vmmDefragment");
+        if(env) return atoi(env);
+        else return 1;
+    })();
+
+    static const double reuseLimit = ([]()->double{
+        const char* env = getenv("reuseLimit");
+        if(env) return atof(env);
+        else return 10.0f;
+    })();
+
+    
+    
+    int64_t net_change_inactive_split_blocks = 0;
+    int64_t net_change_inactive_split_size = 0;  
+
     BlockPool& pool = *p.pool;
 
     if (C10_UNLIKELY(
@@ -1575,8 +2286,195 @@ class DeviceCachingAllocator {
       }
     }
     auto it = pool.blocks.lower_bound(&p.search_key);
-    if (it == pool.blocks.end() || (*it)->stream != p.stream())
+    if (it == pool.blocks.end() || (*it)->stream != p.stream()) {
+      if(vmmDefragment > 0 && !pool.is_small) {
+        auto block_it = free_fused_blocks.blocks.lower_bound(&p.search_key);
+        if (block_it == free_fused_blocks.blocks.end() 
+            || (*block_it)->stream != p.stream() 
+            || (*block_it)->size > (p.search_key.size*reuseLimit))
+        {
+          return false;
+        }
+                              
+            
+        p.block = *block_it;
+            
+            
+        size_t keep_blocks = p.search_key.size/kGranularity;
+           
+        std::unordered_set<Block*> blocks2split;
+        for(size_t i=0; i < keep_blocks; i++) {
+          auto& phy_block = p.block->vmm_segment->phy_blocks[i];
+                
+          if(!phy_block->free) {
+            GMLAKE_INFO(" warning for fused blocks not free, something wrong happended");
+            exit(-1);
+          }
+                
+          phy_block->free = false;
+
+          for(auto& block_segment : phy_block->mapped_blocks) {
+            Block* other_block = block_segment.block;
+                    
+            if(other_block == p.block) continue;
+                    
+            if(other_block->vmm_segment->fused) {
+              if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size() && 
+                free_fused_blocks.blocks.count(other_block)) {
+                  free_fused_blocks.blocks.erase(other_block);
+                  free_fused_blocks_in_release_order[other_block->stream].erase(other_block);
+
+                            
+                  fragmented_free_fused_blocks[other_block->stream].insert(other_block);
+              } else if(active_fused_blocks.count(other_block) == 0) {
+                if(fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block) == 0) {
+                  fragmented_free_fused_blocks[other_block->stream].insert(other_block);
+                }
+              }
+                        
+                        
+              other_block->vmm_segment->free_blocks--;
+            } else {
+              if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size()) {
+                if(large_blocks.blocks.count(other_block)) {
+                  large_blocks.blocks.erase(other_block);
+                                 
+                  blocks2split.insert(other_block);
+               
+                  if(other_block->is_split()) {
+                    net_change_inactive_split_blocks -= 1;
+                    net_change_inactive_split_size -= other_block->size;
+                  }
+                }
+              }
+                        
+                        
+              other_block->vmm_segment->free_blocks--;
+                        
+                        
+              if(other_block->vmm_segment->free_blocks == 0) {
+                blocks2split.erase(other_block);
+                            
+                other_block->allocated = true;
+                active_blocks.insert(other_block);
+                            
+                            
+                update_stat_array(stats.active, 1, p.stat_types);
+                update_stat_array(stats.active_bytes, other_block->size, p.stat_types);
+              }
+            }
+          }
+        }
+            
+            
+        for(auto& block2split : blocks2split) {      
+          if(block2split->vmm_segment->fused || 
+            block2split->vmm_segment->free_blocks == 0 || 
+            block2split->vmm_segment->free_blocks == block2split->vmm_segment->phy_blocks.size()) {
+                    continue;
+          }
+                
+                
+          bool block_free = block2split->vmm_segment->phy_blocks[0]->free;
+          size_t last_offset = 0;
+          Block* prev_block = block2split->prev;
+                
+          auto phy_blocks = block2split->vmm_segment->phy_blocks;
+          auto vmm_segment = std::move(block2split->vmm_segment);
+                
+          for(size_t i=1; i <= phy_blocks.size(); i++) {
+                    
+            if(i == phy_blocks.size() || block_free != phy_blocks[i]->free) {
+              size_t block_size = (i - last_offset)*kGranularity;
+                        
+              char* block_ptr = (char*)block2split->ptr + last_offset*kGranularity;
+              Block* split_block = new Block(p.device(), p.stream(), block_size, p.pool, block_ptr);
+                        
+                        
+              split_block->prev = prev_block;
+              if(prev_block) {
+                prev_block->next = split_block;
+              }
+              split_block->self_last_event = block2split->self_last_event;
+                        
+                        
+              if(i < phy_blocks.size()) {
+                auto remaining_segment = vmm_segment->split(block_size);
+                split_block->vmm_segment = std::move(vmm_segment);
+                vmm_segment = std::move(remaining_segment);
+              } else {
+                split_block->vmm_segment = std::move(vmm_segment);
+              }
+                        
+                        
+              size_t offset = 0;
+              for(auto& phy_block : split_block->vmm_segment->phy_blocks) {
+                phy_block->mapped_blocks[0].block = split_block;
+                phy_block->mapped_blocks[0].offset = offset;
+                offset++;
+              }
+
+
+              if(block_free) {
+                split_block->vmm_segment->free_blocks = split_block->vmm_segment->phy_blocks.size();
+                split_block->vmm_segment->used_blocks = 0;
+                            
+                            
+                large_blocks.blocks.insert(split_block);
+                            
+                            
+                net_change_inactive_split_blocks += 1;
+                net_change_inactive_split_size += split_block->size;
+              } else {
+                split_block->vmm_segment->free_blocks = 0;
+                split_block->vmm_segment->used_blocks = 0;
+                            
+                split_block->allocated = true;
+                active_blocks.insert(split_block);
+                            
+                            
+                update_stat_array(stats.active, 1, p.stat_types);
+                update_stat_array(stats.active_bytes, split_block->size, p.stat_types);
+              }
+          
+
+              if(i < phy_blocks.size()) {
+                block_free = phy_blocks[i]->free;
+              }
+              last_offset = i;
+              prev_block = split_block;
+            }
+          }
+                
+                
+          if(prev_block) {
+            prev_block->next = block2split->next;
+          }
+                
+          if(block2split->next) {
+            block2split->next->prev = prev_block;
+          }
+                
+          delete block2split;
+        }
+            
+        p.block->vmm_segment->free_blocks = (p.block->vmm_segment->phy_blocks.size() - keep_blocks);
+        p.block->vmm_segment->used_blocks = keep_blocks;
+
+              
+        free_fused_blocks.blocks.erase(block_it);
+        free_fused_blocks_in_release_order[p.block->stream].erase(p.block);
+    
+        p.err = cudaSuccess;
+    
+        update_stat_array(stats.inactive_split, net_change_inactive_split_blocks, p.stat_types);
+        update_stat_array(stats.inactive_split_bytes, net_change_inactive_split_size, p.stat_types);
+    
+        return true;
+      }
+        
       return false;
+    }
     // Do not return an oversized block for a large request
     if ((p.size() < CachingAllocatorConfig::max_split_size()) &&
         ((*it)->size >= CachingAllocatorConfig::max_split_size()))
@@ -1588,7 +2486,510 @@ class DeviceCachingAllocator {
     p.block = *it;
     (*it)->gc_count = 0; // Denote this block has been used
     pool.blocks.erase(it);
+    if (vmmDefragment > 0 && p.block->vmm_segment) {
+      for(size_t i=0; i < p.block->vmm_segment->phy_blocks.size(); i++) {
+        auto& phy_block = p.block->vmm_segment->phy_blocks[i];
+        if(!phy_block->free) {
+          GMLAKE_INFO(" warning for non fused blocks has non free phy_block: %lu, something wrong happended, block %p, block->ptr %p, block->size %fMB, free_blocks %lu, used_blocks %lu, event_id: %lu",
+                      i, p.block, p.block->ptr, p.block->size/(1024.f*1024.f), p.block->vmm_segment->free_blocks, p.block->vmm_segment->used_blocks, p.block->self_last_event->event_id);
+            
+              
+          for(auto& block_segment : phy_block->mapped_blocks) {
+            Block* other_block = block_segment.block;
+                  
+            if(other_block == p.block) continue;
+              
+            GMLAKE_INFO(" warning for non fused blocks has non free phy_block: %lu, something wrong happended, co-ref block %p, block->ptr %p, block->size %fMB, free_blocks %lu, used_blocks %lu, event_id: %lu",
+                        i, other_block, other_block->ptr, other_block->size/(1024.f*1024.f), other_block->vmm_segment->free_blocks, other_block->vmm_segment->used_blocks, other_block->self_last_event->event_id);
+          }
+      
+          exit(-1);
+        }
+          
+        phy_block->free = false;
+          
+        for(auto& block_segment : phy_block->mapped_blocks) {
+          Block* other_block = block_segment.block;
+              
+          if(other_block == p.block) continue;
+              
+          if(other_block->vmm_segment->fused) {
+            if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size() && 
+              free_fused_blocks.blocks.count(other_block)) {
+              free_fused_blocks.blocks.erase(other_block);
+              free_fused_blocks_in_release_order[other_block->stream].erase(other_block);
+
+              fragmented_free_fused_blocks[other_block->stream].insert(other_block);
+            } else if(active_fused_blocks.count(other_block) == 0) {
+              if(fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block) == 0) {
+                fragmented_free_fused_blocks[other_block->stream].insert(other_block);
+              }
+            }
+                                
+                  
+            other_block->vmm_segment->free_blocks--;
+          } else {
+            GMLAKE_INFO(" warning for non fused blocks has phy_block mapped to other non fused blocks");
+            exit(-1);
+          }
+        }
+                        
+      }
+      p.block->vmm_segment->free_blocks = 0;
+      p.block->vmm_segment->used_blocks = p.block->vmm_segment->phy_blocks.size();
+
+      
+    }
+    
+    
+    
+    p.err = cudaSuccess;
+    
+    
+    update_stat_array(stats.inactive_split, net_change_inactive_split_blocks, p.stat_types);
+    update_stat_array(stats.inactive_split_bytes, net_change_inactive_split_size, p.stat_types);
     return true;
+  }
+
+  size_t garbage_collect_fused_blocks(int time, size_t require_size = 0) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+      
+    size_t garbage_size = 0;
+    size_t garbage_blocks = 0;
+    for(auto& it : fragmented_free_fused_blocks) {
+      for(auto block_it = it.second.blocks.begin(); block_it != it.second.blocks.end();) {
+        Block* block = (*block_it);
+      
+        cudaError_t err = cudaSuccess;
+        if(block->self_last_event) {
+          err = cudaEventQuery(block->self_last_event->event);
+        }
+              
+        if(err == cudaSuccess) {
+          for(auto& phy_block : block->vmm_segment->phy_blocks) {
+            int i = 0;
+            for(int j = 0; j < phy_block->mapped_blocks.size(); j++) {
+              if(phy_block->mapped_blocks[j].block != block) {
+                if(i != j) {
+                  phy_block->mapped_blocks[i] = phy_block->mapped_blocks[j];
+                }
+                              
+                i++;
+              }
+            }
+            phy_block->mapped_blocks.resize(i);
+          }
+                  
+          garbage_blocks++;
+          garbage_size += block->size;
+                  
+          //free_fused_blocks.blocks.erase(block);
+          block_it = it.second.erase(block_it);
+                  
+                  
+          if(!block->vmm_segment.unique()) {
+            GMLAKE_INFO(" warning block is not unique, ref_count: %lu, block %p, block->ptr %p, block->size %fMB, phy_blocks %lu, free_blocks %lu, used_blocks %lu, event_id: %lu", 
+                        block->vmm_segment.use_count(), block, block->ptr, block->size/(1024.f*1024.f), block->vmm_segment->phy_blocks.size(), block->vmm_segment->free_blocks, block->vmm_segment->used_blocks, block->self_last_event->event_id);
+            exit(-1);
+          }
+                  
+                  
+          if(block->vmm_segment->vir_blocks[0]->vir_dev_ptr.use_count() != block->vmm_segment->vir_blocks.size()) {
+            GMLAKE_INFO(" warning vir_blocks vir_dev_ptr use_count %lu != vir_blocks.size() %lu, block %p, block->ptr %p, block->size %fMB, phy_blocks %lu, free_blocks %lu, used_blocks %lu, event_id: %lu", 
+                        block->vmm_segment->vir_blocks[0]->vir_dev_ptr.use_count(), block->vmm_segment->vir_blocks.size(),
+                        block, block->ptr, block->size/(1024.f*1024.f), block->vmm_segment->phy_blocks.size(), block->vmm_segment->free_blocks, block->vmm_segment->used_blocks, block->self_last_event->event_id);
+            exit(-1);
+          }
+                  
+          {
+            //block->vmm_segment.reset();
+            auto tmp = std::move(block->vmm_segment);
+          }
+                  
+          delete block;
+                  
+          if(require_size > 0 && time <= 1 && garbage_size >= (require_size << (2*(time + 1))) ) break;
+          
+        } else if(err == cudaErrorNotReady) {
+                  
+          GMLAKE_INFO(" fragmented_free_fused_blocks: block self_last_event NotReady %p, block->ptr %p, block->size %fMB, phy_blocks %lu, free_blocks %lu, used_blocks %lu, event_id: %lu", 
+                      block, block->ptr, block->size/(1024.f*1024.f), block->vmm_segment->phy_blocks.size(), block->vmm_segment->free_blocks, block->vmm_segment->used_blocks, block->self_last_event->event_id);
+                  
+                  
+          cudaGetLastError();
+          break;
+        } else {
+          C10_CUDA_CHECK(err);
+          cudaGetLastError();
+          break;
+        }
+      }
+    }
+      
+      
+    GMLAKE_INFO(" gc from fragmented_free_fused_blocks: blocks %lu, size %fMB", garbage_blocks, garbage_size/(1024.f*1024.f));
+      
+      
+    if(time > 0) {
+      for(auto& it : free_fused_blocks_in_release_order) {
+        for(auto block_it = it.second.blocks.begin(); block_it != it.second.blocks.end();) {
+          Block* block = (*block_it);
+      
+          cudaError_t err = cudaSuccess;
+          if(block->self_last_event) {
+            err = cudaEventQuery(block->self_last_event->event);
+          }
+                
+          if(err == cudaSuccess) {
+            for(auto& phy_block : block->vmm_segment->phy_blocks) {
+              int i = 0;
+              for(int j = 0; j < phy_block->mapped_blocks.size(); j++) {
+                if(phy_block->mapped_blocks[j].block != block) {
+                  if(i != j) {
+                    phy_block->mapped_blocks[i] = phy_block->mapped_blocks[j];
+                  }
+                                
+                  i++;
+                }
+              }
+                        
+              phy_block->mapped_blocks.resize(i);
+            }
+                    
+            garbage_blocks++;
+            garbage_size += block->size;
+                    
+            free_fused_blocks.blocks.erase(block);
+            block_it = it.second.erase(block_it);
+                  
+                            
+            if(!block->vmm_segment.unique()) {
+              GMLAKE_INFO(" warning block is not unique, ref_count %lu, block %p, block->ptr %p, block->size %fMB, phy_blocks %lu, free_blocks %lu, used_blocks %lu, event_id: %lu", 
+                          block->vmm_segment.use_count(), block, block->ptr, block->size/(1024.f*1024.f), block->vmm_segment->phy_blocks.size(), block->vmm_segment->free_blocks, block->vmm_segment->used_blocks, block->self_last_event->event_id);
+              exit(-1);
+            }
+                    
+                    
+                  
+            if(block->vmm_segment->vir_blocks[0]->vir_dev_ptr.use_count() != block->vmm_segment->vir_blocks.size()) {
+              GMLAKE_INFO(" warning vir_blocks vir_dev_ptr use_count %lu != vir_blocks.size() %lu, block %p, block->ptr %p, block->size %fMB, phy_blocks %lu, free_blocks %lu, used_blocks %lu, event_id: %lu", 
+                          block->vmm_segment->vir_blocks[0]->vir_dev_ptr.use_count(), block->vmm_segment->vir_blocks.size(),
+                          block, block->ptr, block->size/(1024.f*1024.f), block->vmm_segment->phy_blocks.size(), block->vmm_segment->free_blocks, block->vmm_segment->used_blocks, block->self_last_event->event_id);
+              exit(-1);
+            }
+                    
+            delete block;
+          } else if(err == cudaErrorNotReady) {
+            GMLAKE_INFO(" free_fused_blocks_in_release_order: block self_last_event NotReady %p, block->ptr %p, block->size %fMB, phy_blocks %lu, free_blocks %lu, used_blocks %lu, event_id: %lu", 
+                        block, block->ptr, block->size/(1024.f*1024.f), block->vmm_segment->phy_blocks.size(), block->vmm_segment->free_blocks, block->vmm_segment->used_blocks, block->self_last_event->event_id);
+                    
+            cudaGetLastError();
+            break;
+          } else {
+            C10_CUDA_CHECK(err);
+            cudaGetLastError();
+            break;
+          }
+        }
+      }   
+    }
+      
+      //cudaDeviceSynchronize();
+      
+    GMLAKE_INFO(" gc from free_fused_blocks_in_release_order: blocks %lu, size %fMB", garbage_blocks, garbage_size/(1024.f*1024.f));
+
+    return garbage_size;
+  }
+
+  bool get_fused_fragmented_blocks(AllocParams& p, int time) {
+    static const int vmmDefragment = ([]()->int{
+        const char* env = getenv("vmmDefragment");
+        if(env) return atoi(env);
+        else return 1;
+    })();
+    
+    
+    static const size_t fragment_limit = ([]()->size_t{
+        const char* env = getenv("fragLimit");
+        if(env) return (size_t)std::stoll(env);
+        else return (size_t)(512*1024*1024);
+    })();
+    
+    
+    static const int defragment_level = ([]()->int{
+        const char* env = getenv("defragLevel");
+        if(env) return (int)std::atoi(env);
+        else return (int)0;
+    })();
+    
+    
+    static const int auto_gc_limits = ([]()->int{
+        const char* env = getenv("autoGC");
+        if(env) return (int)std::atoi(env);
+        else return (int)1000;
+    })();
+    
+    
+    if (vmmDefragment <= 0) {
+      return false;
+    }
+    
+    
+    if(time < defragment_level) {
+        return false;
+    }
+    
+    
+    if (p.pool->is_small || p.search_key.size < fragment_limit) {
+      return false;
+    } else {
+      Block left_search_key(p.search_key.device, p.search_key.stream, p.search_key.size, p.search_key.pool, p.search_key.ptr);
+      Block right_search_key(p.search_key.device, p.search_key.stream, p.search_key.size, p.search_key.pool, p.search_key.ptr);
+
+      left_search_key.size = 0;
+      right_search_key.size = std::numeric_limits<size_t>::max();
+
+      auto it_begin = large_blocks.blocks.lower_bound(&left_search_key);
+      if (it_begin == large_blocks.blocks.end() || (*it_begin)->stream != p.stream())
+        return false;
+      
+      auto it_end = large_blocks.blocks.lower_bound(&right_search_key);
+      if (it_end == large_blocks.blocks.begin() || (*std::prev(it_end))->stream != p.stream())
+        return false;
+      
+      
+      if(std::prev(it_end) == it_begin) return false;
+      
+      size_t fuse_size = 0;
+      std::vector<Block*> blocks2fuse;
+      
+      auto it = it_end;
+      while(it != it_begin && fuse_size < p.search_key.size) {
+        it = std::prev(it);
+        blocks2fuse.push_back((*it));
+        fuse_size += (*it)->size;
+      }
+      
+      
+      if(fuse_size < p.search_key.size) {
+          return false;
+      }
+            
+      
+      int64_t net_change_segments = 0;
+      int64_t net_change_inactive_split_blocks = 0;
+      int64_t net_change_inactive_split_size = 0;
+      
+      
+      std::shared_ptr<BlockEvent> current_self_last_event;
+      std::vector<std::shared_ptr<PhyBlock>> phy_blocks2glue;
+      int index = 0;  
+      for(auto& block : blocks2fuse) {
+        for(auto& phy_block : block->vmm_segment->phy_blocks) {
+          phy_block->free = false;
+          phy_blocks2glue.push_back(phy_block);
+        }
+        block->vmm_segment->free_blocks = 0;
+        block->vmm_segment->used_blocks = 0;
+
+        
+        if(!current_self_last_event || 
+          (block->self_last_event && block->self_last_event->event_id > current_self_last_event->event_id)) {
+          current_self_last_event = block->self_last_event;
+        }
+        
+        large_blocks.blocks.erase(block);
+        
+        
+        if(block->is_split()) {
+          net_change_inactive_split_blocks -= 1;
+          net_change_inactive_split_size -= block->size;
+        }
+        
+        
+        
+        block->allocated = true;
+        active_blocks.insert(block);
+        
+        if (index == blocks2fuse.size() - 1 && (fuse_size - p.search_key.size) >= kGranularity) continue;
+        update_stat_array(stats.active, 1, p.stat_types);
+        update_stat_array(stats.active_bytes, block->size, p.stat_types);
+        index++;
+      }
+
+      if(fuse_size > p.search_key.size && (fuse_size - p.search_key.size) >= kGranularity) {
+        Block* last_block = blocks2fuse.back();
+          
+          
+        last_block->allocated = false;
+        if(active_blocks.count(last_block)) {
+          active_blocks.erase(last_block);
+        }
+                      
+          
+        Block* remaining = last_block;
+      
+        size_t original_size = remaining->size;
+        size_t remain_size = (fuse_size - p.search_key.size);
+        size_t keep_size = original_size - remain_size;
+  
+        last_block = new Block(p.device(), p.stream(), keep_size, p.pool, last_block->ptr);
+        last_block->prev = remaining->prev;
+        if (last_block->prev) {
+            last_block->prev->next = last_block;
+        }
+        last_block->next = remaining;
+        last_block->self_last_event = remaining->self_last_event;
+          
+        remaining->prev = last_block;
+        remaining->ptr = static_cast<char*>(remaining->ptr) + keep_size;
+        remaining->size = remain_size;
+          
+        auto remaining_segment = remaining->vmm_segment->split(keep_size);
+        last_block->vmm_segment = std::move(remaining->vmm_segment);
+        remaining->vmm_segment =  std::move(remaining_segment);
+          
+        for(size_t i=0; i<last_block->vmm_segment->phy_blocks.size(); i++) {
+          last_block->vmm_segment->phy_blocks[i]->mapped_blocks[0].block = last_block;
+          last_block->vmm_segment->phy_blocks[i]->mapped_blocks[0].offset = i;
+          last_block->vmm_segment->phy_blocks[i]->free = false;
+        }
+        last_block->vmm_segment->free_blocks = 0;
+        last_block->vmm_segment->used_blocks = 0;
+        last_block->allocated = true;
+                    
+        active_blocks.insert(last_block);
+
+        update_stat_array(stats.active, 1, p.stat_types);
+        update_stat_array(stats.active_bytes, last_block->size, p.stat_types);
+          
+        for(size_t i=0; i<remaining->vmm_segment->phy_blocks.size(); i++) {
+          remaining->vmm_segment->phy_blocks[i]->mapped_blocks[0].block = remaining;
+          remaining->vmm_segment->phy_blocks[i]->mapped_blocks[0].offset = i;
+          remaining->vmm_segment->phy_blocks[i]->free = true;
+        }
+        remaining->vmm_segment->free_blocks = remaining->vmm_segment->phy_blocks.size();
+        remaining->vmm_segment->used_blocks = 0;
+        remaining->allocated = false;
+          
+        large_blocks.blocks.insert(remaining);
+          
+        fuse_size -= remaining->size;
+  
+        size_t keep_blocks = p.search_key.size/kGranularity;
+        phy_blocks2glue.resize(keep_blocks);
+            
+        net_change_inactive_split_blocks += 1;
+        net_change_inactive_split_size += remaining->size;
+      }
+      
+      static constexpr size_t G=1024*1024*1024;
+      
+      using Ms = std::chrono::duration<double, std::milli>;
+      Ms fuse_time = Ms{0};
+      
+      std::shared_ptr<VmmSegment> vmm_segment;
+      int gc_time = 0;
+      do
+      {
+        auto t0 = std::chrono::steady_clock::now();
+          
+        vmm_segment = std::make_shared<VmmSegment>(std::move(phy_blocks2glue));
+          
+        auto t1 = std::chrono::steady_clock::now();
+        fuse_time = (t1-t0);
+          
+        if(vmm_segment->status == CUDA_SUCCESS && vmm_segment->segment_ptr) {
+          break;
+        } else {
+          cudaGetLastError();
+              
+          phy_blocks2glue = std::move(vmm_segment->phy_blocks);
+              
+          GMLAKE_INFO(" allocate virtual address for %lu phy_blocks the %dth time failed, try to garbage_collect_fused_blocks", phy_blocks2glue.size(), gc_time);
+              
+          size_t garbage_size = garbage_collect_fused_blocks(gc_time, p.search_key.size);
+          gc_time++;
+              
+          total_fuse_size -= garbage_size;
+              
+          cudaGetLastError();
+        }
+      } while(gc_time < 3);
+      
+      if(!vmm_segment || vmm_segment->status != CUDA_SUCCESS || !vmm_segment->segment_ptr) {
+          return false;
+      }
+      
+      void* block_ptr = vmm_segment->segment_ptr;
+      Block* fused_block = new Block(p.device(), p.stream(), fuse_size, p.pool, (char*)block_ptr);
+
+      fused_block->vmm_segment = std::move(vmm_segment);
+      fused_block->self_last_event = current_self_last_event;
+
+      for(auto& phy_block : fused_block->vmm_segment->phy_blocks) {
+        for(auto& block_segment : phy_block->mapped_blocks) {
+          Block* other_block = block_segment.block;
+              
+          //since the non fused blocks has already been processed, we only need to process fused blocks 
+          if(other_block->vmm_segment->fused) {
+            if(other_block->vmm_segment->free_blocks == other_block->vmm_segment->phy_blocks.size() && 
+              free_fused_blocks.blocks.count(other_block)) {
+              free_fused_blocks.blocks.erase(other_block);
+              free_fused_blocks_in_release_order[other_block->stream].erase(other_block);
+        
+              fragmented_free_fused_blocks[other_block->stream].insert(other_block);
+            } else if(active_fused_blocks.count(other_block) == 0) {
+              if(fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block) == 0) {
+                fragmented_free_fused_blocks[other_block->stream].insert(other_block);
+              }
+            }
+                  
+
+            other_block->vmm_segment->free_blocks--;
+          }
+        }
+      }
+
+      size_t offset = 0;
+      for(auto& phy_block : fused_block->vmm_segment->phy_blocks) {
+        phy_block->mapped_blocks.emplace_back(fused_block, offset);
+        offset++;
+      }
+      fused_block->vmm_segment->free_blocks = 0;
+      fused_block->vmm_segment->used_blocks = fused_block->vmm_segment->phy_blocks.size();
+
+      p.block = fused_block;
+      p.err = cudaSuccess;
+
+      GMLAKE_INFO(" fused block %p, ptr %p of size %fMB", 
+			            fused_block, fused_block->ptr, fused_block->size/(1024.f*1024.f));
+      
+      net_change_segments += 1;
+
+
+      update_stat_array(stats.segment, net_change_segments, p.stat_types);
+      update_stat_array(stats.inactive_split, net_change_inactive_split_blocks, p.stat_types);
+      update_stat_array(stats.inactive_split_bytes, net_change_inactive_split_size, p.stat_types);
+
+      if(fuse_size >= p.search_key.size) {
+        total_fuse_size += fuse_size;
+        GMLAKE_INFO(" try %d: fuse %lu physical blocks to ptr %p of size %fMB for allocate size %fMB succeeded, takes %fms, total_fuse_size %fMB", 
+                   time, fused_block->vmm_segment->phy_blocks.size(), fused_block->vmm_segment->segment_ptr, fuse_size/(1024.f*1024.f), p.search_key.size/(1024.f*1024.f), fuse_time.count(), total_fuse_size/(1024.f*1024.f));
+        
+        if(total_fuse_size > auto_gc_limits*G) {
+            GMLAKE_INFO(" virtual address larger than %luG, do garbage_collect_fused_blocks() ", auto_gc_limits);
+            
+            size_t garbage_size = garbage_collect_fused_blocks(2, 0);
+            
+            total_fuse_size -= garbage_size;
+        }
+      }
+
+      return fuse_size >= p.search_key.size;
+    } 
+    
+    return false;
   }
 
   bool trigger_free_memory_callbacks(AllocParams& p) {
@@ -1655,6 +3056,210 @@ class DeviceCachingAllocator {
       }
     }
   }
+
+  bool realloc_block(AllocParams& p, bool isRetry) {
+    // Defensively checks for preexisting CUDA error state.
+    C10_CUDA_CHECK(cudaGetLastError());
+
+    
+    static const int vmmDefragment = ([]()->int{
+        const char* env = getenv("vmmDefragment");
+        if(env) return atoi(env);
+        else return 1;
+    })();
+
+
+    static const int reAlloc = ([]()->int{
+        const char* env = getenv("reAlloc");
+        if(env) return atoi(env);
+        else return 0;
+    })();
+
+
+
+    size_t size = p.alloc_size;
+    size_t free_block_size = 0;
+    void* ptr;
+
+    if (isRetry) {
+      stats.num_alloc_retries += 1;
+    }
+
+    std::shared_ptr<VmmSegment> vmm_segment;
+    if (set_fraction &&
+        total_allocated_memory + size > allowed_memory_maximum) {
+      p.err = cudaErrorMemoryAllocation;
+      return false;
+    } else {
+      if(vmmDefragment <= 0 || p.pool->is_small) {
+        p.err = cudaMallocMaybeCapturing(&ptr, size);
+        if (p.err != cudaSuccess) {
+          if (p.err == cudaErrorMemoryAllocation) {
+            // If this is the first attempt (!isRetry), we can forgive and clear CUDA's
+            //   internal error state.
+            // If this is the second attempt (isRetry), malloc's TORCH_CHECK_WITH will take
+            //   over to throw a helpful exception. The user can choose to catch the exception,
+            //   free some stuff in their script, and attempt their allocation again.
+            //   In this case, we can also forgive and clear CUDA's internal error state.
+            cudaGetLastError();
+          } else {
+            // If the error's unrelated to memory allocation, we should throw immediately.
+            C10_CUDA_CHECK(p.err);
+          }
+          return false;
+        }
+      } else {
+        if(reAlloc > 0) {
+          //Block left_search_key = p.search_key;
+          //Block right_search_key = p.search_key;
+                
+          Block left_search_key(p.search_key.device, p.search_key.stream, p.search_key.size, p.search_key.pool, p.search_key.ptr);
+          Block right_search_key(p.search_key.device, p.search_key.stream, p.search_key.size, p.search_key.pool, p.search_key.ptr);
+      
+          left_search_key.size = 0;
+          right_search_key.size = std::numeric_limits<size_t>::max();
+                      
+          auto it_begin = large_blocks.blocks.lower_bound(&left_search_key);
+          auto it_end = large_blocks.blocks.lower_bound(&right_search_key);
+                
+          if(it_begin != large_blocks.blocks.end() && (*it_begin)->stream == p.stream() &&
+            it_end != large_blocks.blocks.begin() && (*std::prev(it_end))->stream == p.stream()) {
+            auto it = it_begin;
+            while(it != it_end) {
+              free_block_size += (*it)->size;
+              it++;
+            }
+          }
+                
+                
+          size_t request_size = p.search_key.size;
+                
+          if(free_block_size >= request_size) {
+            GMLAKE_INFO(" free_block_size %fMB is larger than allocation size %fMB, something weired happended", 
+                       free_block_size/(1024.f*1024.f), size/(1024.f*1024.f));
+            return false;
+          }
+                
+          if(free_block_size > 0) {
+            request_size -= free_block_size;
+            size = get_allocation_size(request_size);
+          }
+        }
+               
+        using Ms = std::chrono::duration<double, std::milli>;
+        Ms fuse_time = Ms{0};
+            
+        int gc_time = 0;
+        do
+        {
+          auto t0 = std::chrono::steady_clock::now();
+                
+          vmm_segment = std::make_shared<VmmSegment>(size/kGranularity, kGranularity, p.device());
+                
+          auto t1 = std::chrono::steady_clock::now();
+          fuse_time = (t1-t0);
+                
+          if(vmm_segment->status == CUDA_SUCCESS && vmm_segment->segment_ptr) {
+            break;
+          } else {
+            cudaGetLastError();
+                            
+            size_t device_free;
+            size_t device_total;
+            cudaMemGetInfo(&device_free, &device_total);
+                            
+            size_t total_garbage_size = fragmented_free_fused_blocks[p.stream()].pool_size + free_fused_blocks_in_release_order[p.stream()].pool_size;
+                  
+                    
+            if(device_free > size && total_garbage_size >= size) {
+              GMLAKE_INFO(" allocate size %luMB memory by vmm the %dth time failed, try to garbage_collect_fused_blocks", size/(1024*1024), gc_time);
+                        
+              vmm_segment.reset();
+              size_t garbage_size = garbage_collect_fused_blocks(gc_time, p.alloc_size);
+              total_fuse_size -= garbage_size;
+                        
+              gc_time++;
+                       
+              cudaGetLastError();
+            } else {
+              break;
+            }
+          }
+        } while(gc_time < 3);
+            
+        if(!vmm_segment || vmm_segment->status != CUDA_SUCCESS || !vmm_segment->segment_ptr) {           
+          p.err = cudaErrorMemoryAllocation;
+          cudaGetLastError();
+          vmm_segment.reset();
+                
+          GMLAKE_INFO(" allocate size %fMB memory by vmm failed", size/(1024.f*1024.f));
+            
+          return false;
+        }
+            
+            
+        ptr = vmm_segment->segment_ptr;
+      }
+    }
+
+    if (p.pool->owner_PrivatePool) {
+      // The block is for a CUDA graph's PrivatePool.
+      p.pool->owner_PrivatePool->cudaMalloc_count++;
+    }
+
+    total_allocated_memory += size;
+    Block* new_block = new Block(p.device(), p.stream(), size, p.pool, (char*)ptr);
+    new_block->vmm_segment = std::move(vmm_segment);
+    
+    for_each_selected_stat_type(p.stat_types, [&](size_t stat_type) {
+      update_stat(stats.segment[stat_type], 1);
+      update_stat(stats.reserved_bytes[stat_type], size);
+    });
+    if (size >= CachingAllocatorConfig::max_split_size())
+      update_stat(stats.oversize_segments, 1);
+
+    // p.block came from new, not cudaMalloc. It should not be nullptr here.
+    //TORCH_INTERNAL_ASSERT(p.block != nullptr && p.block->ptr != nullptr);
+    TORCH_INTERNAL_ASSERT(new_block != nullptr && new_block->ptr != nullptr);
+    
+    
+    if(new_block->vmm_segment) {
+      if(new_block->size < p.search_key.size) {
+        for(size_t i = 0; i < new_block->vmm_segment->phy_blocks.size(); i++) {
+          new_block->vmm_segment->phy_blocks[i]->mapped_blocks.emplace_back(new_block, i);
+          new_block->vmm_segment->phy_blocks[i]->free = true;
+        }
+            
+        new_block->vmm_segment->free_blocks = new_block->vmm_segment->phy_blocks.size();
+        new_block->vmm_segment->used_blocks = 0;
+
+        large_blocks.blocks.insert(new_block);
+            
+        if(!get_fused_fragmented_blocks(p, 4)) {
+          GMLAKE_INFO(" call get_fused_fragmented_blocks failed");
+          return false;
+        }
+      } else {
+        for(size_t i = 0; i < new_block->vmm_segment->phy_blocks.size(); i++) {
+          new_block->vmm_segment->phy_blocks[i]->mapped_blocks.emplace_back(new_block, i);
+          new_block->vmm_segment->phy_blocks[i]->free = false;
+        }
+            
+        new_block->vmm_segment->free_blocks = 0;
+        new_block->vmm_segment->used_blocks = new_block->vmm_segment->phy_blocks.size();
+            
+        p.block = new_block;
+        p.err = cudaSuccess;
+      }
+    } else {
+      p.block = new_block;
+      p.err = cudaSuccess;
+    }
+    
+    return true;
+  }
+
+
 
   bool alloc_block(AllocParams& p, bool isRetry) {
     // Defensively checks for preexisting CUDA error state.
@@ -1789,7 +3394,82 @@ class DeviceCachingAllocator {
   }
 
   void release_block(Block* block) {
-    C10_CUDA_CHECK(cudaFree((void*)block->ptr));
+    static const int vmmDefragment = ([]()->int{
+        const char* env = getenv("vmmDefragment");
+        if(env) return atoi(env);
+        else return 1;
+    })();
+
+
+
+    if (vmmDefragment > 0 && block->vmm_segment) {
+      for(size_t i=0; i < block->vmm_segment->phy_blocks.size(); i++) {
+        auto& phy_block = block->vmm_segment->phy_blocks[i];
+        if(!phy_block->free) {
+          GMLAKE_INFO(" warning for non fused blocks has non free phy_block: %lu, something wrong happended, block %p, block->ptr %p, block->size %fMB, free_blocks %lu, used_blocks %lu, event_id: %lu",
+                                               i, block, block->ptr, block->size/(1024.f*1024.f), block->vmm_segment->free_blocks, block->vmm_segment->used_blocks, block->self_last_event->event_id);
+        }
+
+        for(auto& block_segment : phy_block->mapped_blocks) {
+          Block* other_block = block_segment.block;
+              
+          if(other_block == block) continue;
+              
+          if(other_block->vmm_segment->fused) {
+            if(active_fused_blocks.count(other_block) && 
+              active_fused_blocks_to_gc.count(other_block) == 0) {
+              {
+                auto tmp1 = std::move(other_block->vmm_segment->vir_blocks[block_segment.offset]);
+                auto tmp2 = std::move(other_block->vmm_segment->phy_blocks[block_segment.offset]);
+              }
+                      
+              //active_fused_blocks.erase(other_block);
+              active_fused_blocks_to_gc.insert(other_block);
+            } else if(free_fused_blocks.blocks.count(other_block) || 
+                          fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
+              if(free_fused_blocks.blocks.count(other_block)) {
+                free_fused_blocks.blocks.erase(other_block);
+                free_fused_blocks_in_release_order[other_block->stream].erase(other_block);
+              } else if(fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
+                fragmented_free_fused_blocks[other_block->stream].erase(other_block);
+              }
+       
+              for(auto& phy_block : other_block->vmm_segment->phy_blocks) {
+                int i = 0;
+                for(int j = 0; j < phy_block->mapped_blocks.size(); j++) {
+                  if(phy_block->mapped_blocks[j].block != other_block) {
+                    if(i != j) {
+                      phy_block->mapped_blocks[i] = phy_block->mapped_blocks[j];
+                    }
+                                  
+                    i++;
+                  }
+                }
+                phy_block->mapped_blocks.resize(i);
+              }
+                      
+                      
+              delete other_block;
+            }
+          } else {
+            GMLAKE_INFO(" warning for non fused blocks has phy_block mapped to other non fused blocks");
+            exit(-1);
+          }
+        }
+                        
+      }
+      
+      
+    }
+    
+    
+
+    
+    if(block->vmm_segment){
+      block->vmm_segment.reset();
+    } else {
+      C10_CUDA_CHECK(cudaFree((void*)block->ptr));
+    }
     total_allocated_memory -= block->size;
 
     auto* pool = block->pool;
@@ -1857,7 +3537,8 @@ class DeviceCachingAllocator {
 
         block->event_count--;
         if (block->event_count == 0) {
-          free_block(block);
+          // free_block(block);
+          update_block(block);
         }
       }
     }
@@ -1883,6 +3564,31 @@ class DeviceCachingAllocator {
     }
 
     C10_CUDA_CHECK(cudaSetDevice(prev_device));
+  }
+
+  void insert_free_event_into_alloc_stream(Block* block)
+  {
+    int prev_device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&prev_device));
+    if(prev_device != block->device)
+    {
+      C10_CUDA_CHECK(cudaSetDevice(block->device));
+    }
+  
+
+    
+    if( block->self_last_event && 
+        block->self_last_event.unique() && 
+        block->self_last_event->stream == block->stream && 
+        !block->self_last_event->ref_as_sync) {
+      block->self_last_event->record(block->stream);
+    } else {
+      block->self_last_event = std::make_shared<BlockEvent>(block->stream, true);
+    }
+
+    if(prev_device != block->device) {
+      C10_CUDA_CHECK(cudaSetDevice(prev_device));
+    }
   }
 
   void insert_events_deferred_until_no_capture() {
@@ -1925,7 +3631,8 @@ class DeviceCachingAllocator {
 
         block->event_count--;
         if (block->event_count == 0) {
-          free_block(block);
+          // free_block(block);
+          update_block(block);
         }
         it->second.pop_front();
       }
@@ -2020,6 +3727,14 @@ class NativeCachingAllocator : public CUDAAllocator {
 
   void init(int device_count) override {
     const auto size = static_cast<int64_t>(device_allocator.size());
+    static const int vmmDefragment = ([]()->int{
+        const char* env = getenv("vmmDefragment");
+        if(env) return atoi(env);
+        else return 1;
+    })();
+    if (vmmDefragment) {
+        GMLAKE_INFO(" GMLAKE initialized");
+    }
     if (size < device_count) {
       device_allocator.resize(device_count);
       for (const auto i : c10::irange(size, device_count)) {

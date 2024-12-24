@@ -407,16 +407,17 @@ struct VmmSegment {
         }
     }
     
-    VmmSegment(std::vector<std::shared_ptr<PhyBlock>>&& phy_blocks_in):phy_blocks(std::move(phy_blocks_in)), 
-                                                                          granul_size(phy_blocks[0]->block_size), 
-                                                                          segment_ptr(nullptr), 
-                                                                          device_id(phy_blocks[0]->device_id),
-                                                                          status(CUDA_SUCCESS),
-                                                                          free_blocks(phy_blocks.size()),
-                                                                          used_blocks(0),
-                                                                          fused(true),
-                                                                          released(false) {
-        mapVirAddr();
+    VmmSegment(std::vector<std::shared_ptr<PhyBlock>>&& phy_blocks_in,
+                double virtual_reserve_ratio = 1.0):phy_blocks(std::move(phy_blocks_in)),                 //这里是构建sBlock，要在这里进行额外的地址申请
+                                                    granul_size(phy_blocks[0]->block_size), 
+                                                    segment_ptr(nullptr), 
+                                                    device_id(phy_blocks[0]->device_id),
+                                                    status(CUDA_SUCCESS),
+                                                    free_blocks(phy_blocks.size()),
+                                                    used_blocks(0),
+                                                    fused(true),
+                                                    released(false) {
+        mapVirAddr(virtual_reserve_ratio);
     }
     
     
@@ -479,13 +480,19 @@ struct VmmSegment {
         }
     }
     
-    void* mapVirAddr() {
+    void* mapVirAddr(double virtual_reserve_ratio = 1.0) {
         static constexpr int retry_times = 8;
         static std::mutex alloc_mutex;
 
         
         CUdeviceptr device_ptr = 0ULL;
         size_t segment_size = phy_blocks.size() * granul_size;
+
+        if(fused && virtual_reserve_ratio > 1.0) {                                       //按理来说浮点数不能直接比较大小，但是这里的两个数都是直接赋值的，所以可以比较
+            size_t additional_size = segment_size * (virtual_reserve_ratio - 1);
+            size_t aligned_additional_size = ((additional_size + granul_size - 1) / granul_size) * granul_size;
+            segment_size += aligned_additional_size;
+        }
         
         
         int current_try = 0;
@@ -543,11 +550,106 @@ struct VmmSegment {
         
         return nullptr;
     }
+
+    bool expandSegment(size_t additional_size){   
+
+        GMLAKE_INFO("try expandSegment");
+
+        if(!fused) {
+            GMLAKE_INFO("Cannot expand segment, it is not fused");
+            return false;
+        }
+
+        //确保additional_size是按照granul_size对齐
+        size_t required_blocks = (additional_size + granul_size - 1) / granul_size;
+        size_t aligned_size = required_blocks * granul_size;
+
+        size_t current_size = phy_blocks.size() * granul_size;
+        size_t total_virtual_size = vir_blocks[0] -> vir_dev_ptr -> allocSize;
+        size_t available_virtual_size = total_virtual_size - current_size;
+
+        if(aligned_size > available_virtual_size) {
+            GMLAKE_INFO("Not enough virtual space for expansion: requested %zuMB, available %zuMB",
+                    aligned_size/(1024*1024), 
+                    available_virtual_size/(1024*1024));
+            return false;
+        }
+        
+        //申请额外的物理内存
+        size_t current_blocks = phy_blocks.size();
+        phy_blocks.reserve(current_blocks + required_blocks);
+        for (size_t i = 0; i < required_blocks; i++) {
+            auto new_phy_block = std::make_shared<PhyBlock>(device_id, granul_size);
+            if(new_phy_block -> status != CUDA_SUCCESS) {
+                size_t device_free;
+                size_t device_total;
+                cudaMemGetInfo(&device_free, &device_total);
+
+                GMLAKE_INFO(" allocate memory handle for %luth phy_block failed, current memory info: device_total: %luMB, device_free: %luMB, request size: %luMB, already allocate: %luMB",
+                                             i, device_total/(1024*1024), device_free/(1024*1024), (required_blocks*granularitySize)/(1024*1024), ((i+1)*granularitySize)/(1024*1024));
+                status = new_phy_block -> status;
+                phy_blocks.clear();
+                cudaGetLastError();
+                break;
+            } else {
+                phy_blocks.emplace_back(std::move(new_phy_block));
+            }
+        }
+
+        static constexpr int retry_times = 8;
+        static std::mutex expand_mutex;
+        int current_try = 0;
+        CUresult result = CUDA_SUCCESS;
+        //将申请的物理内存映射到预留的虚拟地址空间
+        do
+        {
+            std::lock_guard<std::mutex> lock(expand_mutex);
+
+            vir_blocks.resize(phy_blocks.size());
+
+            size_t current_offset = current_size;
+            for (size_t j = current_blocks; j < phy_blocks.size(); j++) {
+                auto phy_block = phy_blocks[j];
+
+                auto vir_block = std::make_shared<VirBlock>(vir_blocks[0] -> vir_dev_ptr, current_offset, granul_size, phy_block, device_id);
+                
+                if(vir_block -> status != CUDA_SUCCESS) {
+                    result = vir_block -> status;
+                    vir_blocks.clear();
+                    cudaGetLastError();
+                    GMLAKE_INFO(" map memory %p of size %fMB for the %luth phy_block failed", vir_block->block_ptr, granul_size/(1024.f*1024.f), j);
+                    break;
+                } else {
+                    vir_blocks.emplace_back(std::move(vir_block));
+                }
+
+                current_offset += granul_size;
+            }
+            current_try ++;
+        } while(result != CUDA_SUCCESS && current_try < retry_times);
+
+        status = result;
+
+        if(result == CUDA_SUCCESS) {
+            
+            free_blocks += required_blocks;
+
+            GMLAKE_INFO("Successfully expanded segment: added %zu blocks (%zuMB), total physical size: %zuMB, virtual size: %zuMB",
+                required_blocks,
+                aligned_size/(1024*1024),
+                (phy_blocks.size() * granul_size)/(1024*1024),
+                total_virtual_size/(1024*1024));
+
+            return true;
+        }
+
+        return false;
+    }
     
     
     
     
-    std::shared_ptr<VmmSegment> split(size_t keep_size) {
+    std::shared_ptr<VmmSegment> split(size_t keep_size) {                                               //因为sBlock一定不会分割，所以这里不需要处理这个函数
         if(keep_size%granul_size) {
             GMLAKE_INFO(" keep_size %fMB is not multiple of granul_size %fMB", keep_size/(1024.f*1024.f), granul_size/(1024.f*1024.f));
             gtrace();
@@ -591,7 +693,7 @@ struct VmmSegment {
     }
     
     
-    bool remerge(VmmSegment& segment) {
+    bool remerge(VmmSegment& segment) {                                       
         if( segment.segment_ptr ==  (void*) ( (char*)this->segment_ptr + this->phy_blocks.size()*granul_size) ) {
            for(size_t i=0; i< segment.phy_blocks.size(); i++) {
                this->phy_blocks.emplace_back(std::move(segment.phy_blocks[i]));

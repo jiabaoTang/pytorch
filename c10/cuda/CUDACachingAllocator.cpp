@@ -1292,7 +1292,7 @@ class DeviceCachingAllocator {
                     if(other_block->stream == block->stream &&
                       fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
                       fragmented_free_fused_blocks[other_block->stream].erase(other_block);
-                                      
+
                       free_fused_blocks.blocks.insert(other_block);
                       free_fused_blocks_by_expandable.blocks.insert(other_block);
                       free_fused_blocks_in_release_order[other_block->stream].insert(other_block);
@@ -1361,7 +1361,7 @@ class DeviceCachingAllocator {
                     if(other_block->stream == block->stream &&
                       fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
                       fragmented_free_fused_blocks[other_block->stream].erase(other_block);
-                                      
+
                       free_fused_blocks.blocks.insert(other_block);
                       free_fused_blocks_by_expandable.blocks.insert(other_block);
                       free_fused_blocks_in_release_order[other_block->stream].insert(other_block);
@@ -1643,7 +1643,7 @@ class DeviceCachingAllocator {
                   if(other_block->stream == block->stream &&
                     fragmented_free_fused_blocks[other_block->stream].blocks.count(other_block)) {
                     fragmented_free_fused_blocks[other_block->stream].erase(other_block);
-                                      
+
                     free_fused_blocks.blocks.insert(other_block);
                     free_fused_blocks_by_expandable.blocks.insert(other_block);
                     free_fused_blocks_in_release_order[other_block->stream].insert(other_block);
@@ -1676,7 +1676,7 @@ class DeviceCachingAllocator {
           if(fragmented_free_fused_blocks[block->stream].blocks.count(block)) {
             fragmented_free_fused_blocks[block->stream].erase(block);
           }
-                  
+
           free_fused_blocks.blocks.insert(block);
           free_fused_blocks_by_expandable.blocks.insert(block);
           free_fused_blocks_in_release_order[block->stream].insert(block);
@@ -2801,23 +2801,39 @@ class DeviceCachingAllocator {
         fuse_size += (*it)->size;
       }
 
-      
+
       if(fuse_size < p.search_key.size) {
           GMLAKE_INFO("aaa");
           Block search_key(p.search_key.device, p.search_key.stream, p.search_key.size, p.search_key.pool, p.search_key.ptr, p.search_key.size);
           auto it = free_fused_blocks_by_expandable.blocks.lower_bound(&search_key);
           if (it == free_fused_blocks_by_expandable.blocks.end()
               || (*it)->stream != p.stream()) {
+            GMLAKE_INFO("can't find free fused block");
+            if(free_fused_blocks_by_expandable.blocks.empty()){
+              GMLAKE_INFO("free_fused_blocks_by_expandable_blocks is empty");
+              if(free_fused_blocks.blocks.empty()) GMLAKE_INFO("free_fused_blocks is also empty");
+              return false;
+            }
+
+            auto it1 = free_fused_blocks_by_expandable.blocks.begin();
+            GMLAKE_INFO("p.serch_key.stream: %lu", p.search_key.stream);
+            GMLAKE_INFO("p.serch_key.stream: %lu", (*it1)->stream);
+            GMLAKE_INFO("has %luMB but can expand to %luMB free block but need %luMB", (*it1) -> size/(1024*1024), (*it1) -> vmm_segment -> vir_blocks[0] -> vir_dev_ptr -> allocSize/(1024*1024), p.search_key.size/(1024*1024));
             return false;
           }
-
           p.block = *it;
 
+          GMLAKE_INFO("has %luMB and need %luMB", p.block -> size/ 1024/ 1024, p.search_key.size / 1024/ 1024);
           size_t expandable_size = p.search_key.size - p.block -> size;
+          GMLAKE_INFO("expandable_size is %lu", expandable_size);
+          if (expandable_size < 0) return false;
           size_t old_phy_blocks_size = p.block -> vmm_segment -> phy_blocks.size();
           Block* last_block = p.block -> vmm_segment -> phy_blocks.back() -> mapped_blocks[0].block;
+          GMLAKE_INFO("last pBlock has been used in %lu sBlocks", last_block -> vmm_segment -> phy_blocks[0] -> mapped_blocks.size());
           size_t last_block_size = last_block -> size;
+          GMLAKE_INFO("last pBlock size: %luMB", last_block -> size);
           size_t last_block_offset = last_block -> vmm_segment -> phy_blocks.size();
+          GMLAKE_INFO("it's time to expansSegment");
           if (p.block -> vmm_segment -> expandSegment(expandable_size)) {
 
             GMLAKE_INFO("TJB expandSegment %fMB, expandable_size %fMB", p.block -> size/(1024.f*1024.f), expandable_size/(1024.f*1024.f));
@@ -2827,8 +2843,10 @@ class DeviceCachingAllocator {
 
             size_t aligned_expandable_size = p.block -> vmm_segment -> phy_blocks.size() * kGranularity - p.block -> size;
 
+            GMLAKE_INFO("total_fused_size: %luMB", total_fuse_size / 1024 / 1024);
             //更新刚增加的物理块的信息
             total_fuse_size += aligned_expandable_size;
+            GMLAKE_INFO("total_fused_size: %luMB", total_fuse_size / 1024 / 1024);
 
             //先将增加的单位物理块放到最后一个pBlock中，更新pBlock和sBlock的大小信息
             for (size_t i = old_phy_blocks_size; i < p.block -> vmm_segment -> phy_blocks.size(); i++) {
@@ -2839,11 +2857,17 @@ class DeviceCachingAllocator {
               last_block_offset++;
               p.block -> vmm_segment -> phy_blocks[i] -> mapped_blocks.emplace_back(p.block, i);
             }
+            large_blocks.blocks.erase(last_block);
+            last_block -> vmm_segment -> free_blocks = 0;
+            last_block -> allocated = true;                                                                    //在改变last_block的比较size之前，先把它移除。
+            update_stat_array(stats.active, 1, p.stat_types);
             last_block -> vmm_segment -> free_blocks = last_block -> vmm_segment -> phy_blocks.size();
             p.block -> vmm_segment -> free_blocks = p.block -> vmm_segment -> phy_blocks.size();
             last_block -> size = last_block -> vmm_segment -> phy_blocks.size() * kGranularity;
             p.block -> size = p.block -> vmm_segment -> phy_blocks.size() * kGranularity;
-
+            
+            update_stat_array(stats.active_bytes, last_block -> size, p.stat_types);
+            active_blocks.insert(last_block);
             //更新状态相关的信息
             for_each_selected_stat_type(p.stat_types, [&](size_t stat_type){
               update_stat(stats.reserved_bytes[stat_type], aligned_expandable_size);
@@ -2868,6 +2892,7 @@ class DeviceCachingAllocator {
                 Block* other_block = block_segment.block;
 
                 if(other_block == p.block) continue;
+                if(other_block == last_block) continue;
 
                 if(other_block -> vmm_segment -> fused) {
                   if(other_block -> vmm_segment -> free_blocks == other_block -> vmm_segment -> phy_blocks.size() &&
@@ -2921,6 +2946,7 @@ class DeviceCachingAllocator {
             update_stat_array(stats.inactive_split, net_change_inactive_split_blocks, p.stat_types);
             update_stat_array(stats.inactive_split_bytes, net_change_inactive_split_size, p.stat_types);
 
+            GMLAKE_INFO("has distribute expandable block");
             return true;
           }
           return false;

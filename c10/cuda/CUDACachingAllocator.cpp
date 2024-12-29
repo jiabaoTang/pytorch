@@ -2759,6 +2759,12 @@ class DeviceCachingAllocator {
       if(env) return (double)std::atof(env);
       else return (double)1.0;
     })();
+
+    static const int dp_fuse = ([]()->int{
+      const char* env = getenv("dpFuse");
+      if(env) return (int)std::atoi(env);
+      else return (int)0;
+    })();
     
     
     if (vmmDefragment <= 0) {
@@ -2793,63 +2799,68 @@ class DeviceCachingAllocator {
       
       size_t fuse_size = 0;
       std::vector<Block*> blocks2fuse;
-      
+
       auto it = it_end;
-      size_t n = 0;
-      while(it != it_begin) {
-        n ++;
-        it = std::prev(it);
-        // blocks2fuse.push_back((*it));
-        fuse_size += (*it)->size;          //这里原本的fuse_size应该是blocks2fuse中块的总大小，现在变成了所有能用的pBlock的总大小
+      if(dp_fuse){
+        while(it != it_begin) {
+          it = std::prev(it);
+          fuse_size += (*it)->size;          //这里原本的fuse_size应该是blocks2fuse中块的总大小，现在变成了所有能用的pBlock的总大小
+        }
+      } else {
+        while(it != it_begin && fuse_size < p.search_key.size){
+          it = std::prev(it);
+          blocks2fuse.push_back((*it));
+          fuse_size += (*it)->size;
+        }
       }
 
 
       if(fuse_size < p.search_key.size) {
         if(expand_scale > 1.0){
-          GMLAKE_INFO("aaa");
+          // GMLAKE_INFO("aaa");
           Block search_key(p.search_key.device, p.search_key.stream, p.search_key.size, p.search_key.pool, p.search_key.ptr, p.search_key.size);
           auto it = free_fused_blocks_by_expandable.blocks.lower_bound(&search_key);
           if (it == free_fused_blocks_by_expandable.blocks.end()
               || (*it)->stream != p.stream()) {
-            GMLAKE_INFO("can't find free fused block");
-            if(free_fused_blocks_by_expandable.blocks.empty()){
-              GMLAKE_INFO("free_fused_blocks_by_expandable_blocks is empty");
-              if(free_fused_blocks.blocks.empty()) GMLAKE_INFO("free_fused_blocks is also empty");
-              return false;
-            }
+            // GMLAKE_INFO("can't find free fused block");
+            // if(free_fused_blocks_by_expandable.blocks.empty()){
+              // GMLAKE_INFO("free_fused_blocks_by_expandable_blocks is empty");
+              // if(free_fused_blocks.blocks.empty()) GMLAKE_INFO("free_fused_blocks is also empty");
+              // return false;
+            // }
 
-            auto it1 = free_fused_blocks_by_expandable.blocks.begin();
-            GMLAKE_INFO("p.serch_key.stream: %lu", p.search_key.stream);
-            GMLAKE_INFO("p.serch_key.stream: %lu", (*it1)->stream);
-            GMLAKE_INFO("has %luMB but can expand to %luMB free block but need %luMB", (*it1) -> size/(1024*1024), (*it1) -> vmm_segment -> vir_blocks[0] -> vir_dev_ptr -> allocSize/(1024*1024), p.search_key.size/(1024*1024));
+            // auto it1 = free_fused_blocks_by_expandable.blocks.begin();
+            // GMLAKE_INFO("p.serch_key.stream: %lu", p.search_key.stream);
+            // GMLAKE_INFO("p.serch_key.stream: %lu", (*it1)->stream);
+            // GMLAKE_INFO("has %luMB but can expand to %luMB free block but need %luMB", (*it1) -> size/(1024*1024), (*it1) -> vmm_segment -> vir_blocks[0] -> vir_dev_ptr -> allocSize/(1024*1024), p.search_key.size/(1024*1024));
             return false;
           }
           p.block = *it;
 
-          GMLAKE_INFO("has %luMB and need %luMB", p.block -> size/ 1024/ 1024, p.search_key.size / 1024/ 1024);
+          // GMLAKE_INFO("has %luMB and need %luMB", p.block -> size/ 1024/ 1024, p.search_key.size / 1024/ 1024);
           size_t expandable_size = p.search_key.size - p.block -> size;
-          GMLAKE_INFO("expandable_size is %lu", expandable_size);
+          // GMLAKE_INFO("expandable_size is %lu", expandable_size);
           if (expandable_size < 0) return false;
           size_t old_phy_blocks_size = p.block -> vmm_segment -> phy_blocks.size();
           Block* last_block = p.block -> vmm_segment -> phy_blocks.back() -> mapped_blocks[0].block;
-          GMLAKE_INFO("last pBlock has been used in %lu sBlocks", last_block -> vmm_segment -> phy_blocks[0] -> mapped_blocks.size());
+          // GMLAKE_INFO("last pBlock has been used in %lu sBlocks", last_block -> vmm_segment -> phy_blocks[0] -> mapped_blocks.size());
           size_t last_block_size = last_block -> size;
-          GMLAKE_INFO("last pBlock size: %luMB", last_block -> size);
+          // GMLAKE_INFO("last pBlock size: %luMB", last_block -> size);
           size_t last_block_offset = last_block -> vmm_segment -> phy_blocks.size();
-          GMLAKE_INFO("it's time to expansSegment");
+          // GMLAKE_INFO("it's time to expansSegment");
           if (p.block -> vmm_segment -> expandSegment(expandable_size)) {
 
-            GMLAKE_INFO("TJB expandSegment %fMB, expandable_size %fMB", p.block -> size/(1024.f*1024.f), expandable_size/(1024.f*1024.f));
+            GMLAKE_INFO("TJB has a %luMB block, has expanded %luMB, and want %luMB", p.block -> size/(1024*1024), expandable_size/(1024*1024), p.search_key.size/(1024*1024));
 
             int64_t net_change_inactive_split_blocks = 0;
             int64_t net_change_inactive_split_size = 0;  
 
             size_t aligned_expandable_size = p.block -> vmm_segment -> phy_blocks.size() * kGranularity - p.block -> size;
 
-            GMLAKE_INFO("total_fused_size: %luMB", total_fuse_size / 1024 / 1024);
+            // GMLAKE_INFO("total_fused_size: %luMB", total_fuse_size / 1024 / 1024);
             //更新刚增加的物理块的信息
             total_fuse_size += aligned_expandable_size;
-            GMLAKE_INFO("total_fused_size: %luMB", total_fuse_size / 1024 / 1024);
+            // GMLAKE_INFO("total_fused_size: %luMB", total_fuse_size / 1024 / 1024);
 
             //先将增加的单位物理块放到最后一个pBlock中，更新pBlock和sBlock的大小信息
             for (size_t i = old_phy_blocks_size; i < p.block -> vmm_segment -> phy_blocks.size(); i++) {
@@ -2956,32 +2967,35 @@ class DeviceCachingAllocator {
         return false;
       }
 
+      if(dp_fuse)
+      {
+        GMLAKE_INFO("TJB use dp to fuse block");
+        fuse_size = fuse_size / kGranularity;
+        //动态规划求解最合适的pBlock    
+        std::vector<int> dp(fuse_size + 1, INT_MAX);
+        dp[0] = 0;
 
-      fuse_size = fuse_size / kGranularity;
-      //动态规划求解最合适的pBlock    
-      std::vector<int> dp(fuse_size + 1, INT_MAX);
-      dp[0] = 0;
-
-      for(auto i = it_begin; i != it_end; ++i) {
-        for (int j = fuse_size - ((*i) -> size) / kGranularity; j >= 0; --j){
-          if(dp[j] != INT_MAX){
-            dp[j + ((*i) -> size) / kGranularity] = std::min(static_cast<int>(dp[j + ((*i)->size) / kGranularity]), static_cast<int>(dp[j] + ((*i)->size) / kGranularity));
-          }
-        }
-      }
-      for (int x = (p.search_key.size + kGranularity - 1) / kGranularity; x <= fuse_size; ++x){
-        if(dp[x] != INT_MAX){
-          int remaining_volume = x;
-
-          for (auto i = it_end; i != it_begin;) {
-            i = std::prev(i);
-            if(remaining_volume - static_cast<int>(((*i) -> size) / kGranularity) >= 0 && dp[remaining_volume - ((*i) -> size) / kGranularity] != INT_MAX){
-              blocks2fuse.push_back((*i));
-              remaining_volume -= ((*i) -> size) / kGranularity;
+        for(auto i = it_begin; i != it_end; ++i) {
+          for (int j = fuse_size - ((*i) -> size) / kGranularity; j >= 0; --j){
+            if(dp[j] != INT_MAX){
+              dp[j + ((*i) -> size) / kGranularity] = std::min(static_cast<int>(dp[j + ((*i)->size) / kGranularity]), static_cast<int>(dp[j] + ((*i)->size) / kGranularity));
             }
           }
-          fuse_size = x * kGranularity;
-          break;
+        }
+        for (int x = (p.search_key.size + kGranularity - 1) / kGranularity; x <= fuse_size; ++x){
+          if(dp[x] != INT_MAX){
+            int remaining_volume = x;
+
+            for (auto i = it_end; i != it_begin;) {
+              i = std::prev(i);
+              if(remaining_volume - static_cast<int>(((*i) -> size) / kGranularity) >= 0 && dp[remaining_volume - ((*i) -> size) / kGranularity] != INT_MAX){
+                blocks2fuse.push_back((*i));
+                remaining_volume -= ((*i) -> size) / kGranularity;
+              }
+            }
+            fuse_size = x * kGranularity;
+            break;
+          }
         }
       }
 

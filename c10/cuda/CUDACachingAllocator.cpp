@@ -2795,14 +2795,17 @@ class DeviceCachingAllocator {
       std::vector<Block*> blocks2fuse;
       
       auto it = it_end;
-      while(it != it_begin && fuse_size < p.search_key.size) {
+      size_t n = 0;
+      while(it != it_begin) {
+        n ++;
         it = std::prev(it);
-        blocks2fuse.push_back((*it));
-        fuse_size += (*it)->size;
+        // blocks2fuse.push_back((*it));
+        fuse_size += (*it)->size;          //这里原本的fuse_size应该是blocks2fuse中块的总大小，现在变成了所有能用的pBlock的总大小
       }
 
 
       if(fuse_size < p.search_key.size) {
+        if(expand_scale > 1.0){
           GMLAKE_INFO("aaa");
           Block search_key(p.search_key.device, p.search_key.stream, p.search_key.size, p.search_key.pool, p.search_key.ptr, p.search_key.size);
           auto it = free_fused_blocks_by_expandable.blocks.lower_bound(&search_key);
@@ -2949,10 +2952,39 @@ class DeviceCachingAllocator {
             GMLAKE_INFO("has distribute expandable block");
             return true;
           }
-          return false;
+        }
+        return false;
       }
-            
-      
+
+
+      fuse_size = fuse_size / kGranularity;
+      //动态规划求解最合适的pBlock    
+      std::vector<int> dp(fuse_size + 1, INT_MAX);
+      dp[0] = 0;
+
+      for(auto i = it_begin; i != it_end; ++i) {
+        for (int j = fuse_size - ((*i) -> size) / kGranularity; j >= 0; --j){
+          if(dp[j] != INT_MAX){
+            dp[j + ((*i) -> size) / kGranularity] = std::min(static_cast<int>(dp[j + ((*i)->size) / kGranularity]), static_cast<int>(dp[j] + ((*i)->size) / kGranularity));
+          }
+        }
+      }
+      for (int x = (p.search_key.size + kGranularity - 1) / kGranularity; x <= fuse_size; ++x){
+        if(dp[x] != INT_MAX){
+          int remaining_volume = x;
+
+          for (auto i = it_end; i != it_begin;) {
+            i = std::prev(i);
+            if(remaining_volume - static_cast<int>(((*i) -> size) / kGranularity) >= 0 && dp[remaining_volume - ((*i) -> size) / kGranularity] != INT_MAX){
+              blocks2fuse.push_back((*i));
+              remaining_volume -= ((*i) -> size) / kGranularity;
+            }
+          }
+          fuse_size = x * kGranularity;
+          break;
+        }
+      }
+
       int64_t net_change_segments = 0;
       int64_t net_change_inactive_split_blocks = 0;
       int64_t net_change_inactive_split_size = 0;

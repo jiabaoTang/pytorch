@@ -2799,11 +2799,15 @@ class DeviceCachingAllocator {
       
       size_t fuse_size = 0;
       std::vector<Block*> blocks2fuse;
+      size_t n = 0;
 
       auto it = it_end;
       if(dp_fuse){
+        // GMLAKE_INFO("target Block: %lu", p.search_key.size / (1024 * 1024));
         while(it != it_begin) {
+          n ++;
           it = std::prev(it);
+          // GMLAKE_INFO("has pBlock: %lu", (*it) -> size / (1024 * 1024));
           fuse_size += (*it)->size;          //这里原本的fuse_size应该是blocks2fuse中块的总大小，现在变成了所有能用的pBlock的总大小
         }
       } else {
@@ -2972,24 +2976,27 @@ class DeviceCachingAllocator {
         GMLAKE_INFO("TJB use dp to fuse block");
         fuse_size = fuse_size / kGranularity;
         //动态规划求解最合适的pBlock    
-        std::vector<int> dp(fuse_size + 1, INT_MAX);
-        dp[0] = 0;
+        std::vector<std::vector<int>> dp(n + 1, std::vector<int>(fuse_size + 1, INT_MAX));
+        dp[0][0] = 0;
 
-        for(auto i = it_begin; i != it_end; ++i) {
-          for (int j = fuse_size - ((*i) -> size) / kGranularity; j >= 0; --j){
-            if(dp[j] != INT_MAX){
-              dp[j + ((*i) -> size) / kGranularity] = std::min(static_cast<int>(dp[j + ((*i)->size) / kGranularity]), static_cast<int>(dp[j] + ((*i)->size) / kGranularity));
+        int k = 1;
+        for(auto i = it_begin; i != it_end, k <= n; ++i, ++k) {
+          for (int j = 0; j <= fuse_size; ++j){
+            dp[k][j] = dp[k - 1][j];
+            if(j >= ((*i) -> size) / kGranularity && dp[k - 1][j - ((*i) -> size) / kGranularity] != INT_MAX){
+              dp[k][j] = std::min(static_cast<int>(dp[k][j]), static_cast<int>(dp[k -1][j - ((*i) -> size) / kGranularity] + ((*i) -> size) / kGranularity));
             }
           }
         }
         for (int x = (p.search_key.size + kGranularity - 1) / kGranularity; x <= fuse_size; ++x){
-          if(dp[x] != INT_MAX){
+          if(dp[n][x] != INT_MAX){
             int remaining_volume = x;
-
-            for (auto i = it_end; i != it_begin;) {
+            k = n;
+            for (auto i = it_end; i != it_begin, k > 0; --k) {
               i = std::prev(i);
-              if(remaining_volume - static_cast<int>(((*i) -> size) / kGranularity) >= 0 && dp[remaining_volume - ((*i) -> size) / kGranularity] != INT_MAX){
+              if(remaining_volume >= static_cast<int>(((*i) -> size) / kGranularity) && dp[k][remaining_volume] == dp[k - 1][remaining_volume - ((*i) -> size) / kGranularity] + ((*i) -> size) / kGranularity){
                 blocks2fuse.push_back((*i));
+                // GMLAKE_INFO("fuse pBlock: %lu", (*i) -> size / (1024 * 1024));
                 remaining_volume -= ((*i) -> size) / kGranularity;
               }
             }

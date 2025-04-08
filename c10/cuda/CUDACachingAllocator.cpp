@@ -2522,8 +2522,8 @@ class DeviceCachingAllocator {
                   
             if(other_block == p.block) continue;
               
-            GMLAKE_INFO(" warning for non fused blocks has non free phy_block: %lu, something wrong happended, co-ref block %p, block->ptr %p, block->size %fMB, free_blocks %lu, used_blocks %lu, event_id: %lu",
-                        i, other_block, other_block->ptr, other_block->size/(1024.f*1024.f), other_block->vmm_segment->free_blocks, other_block->vmm_segment->used_blocks, other_block->self_last_event->event_id);
+            GMLAKE_INFO(" warning for non fused blocks has non free phy_block: %lu, something wrong happended, co-ref block %p, block->ptr %p, block->size %fMB, free_blocks %lu, used_blocks %lu, event_id: %lu, in_active: %lu, in_free: %lu",
+                        i, other_block, other_block->ptr, other_block->size/(1024.f*1024.f), other_block->vmm_segment->free_blocks, other_block->vmm_segment->used_blocks, other_block->self_last_event->event_id, active_fused_blocks.count(other_block), free_fused_blocks.blocks.count(other_block));        
           }
       
           exit(-1);
@@ -2846,15 +2846,18 @@ class DeviceCachingAllocator {
           // GMLAKE_INFO("expandable_size is %lu", expandable_size);
           if (expandable_size < 0) return false;
           size_t old_phy_blocks_size = p.block -> vmm_segment -> phy_blocks.size();
-          Block* last_block = p.block -> vmm_segment -> phy_blocks.back() -> mapped_blocks[0].block;
+          // Block* last_block = p.block -> vmm_segment -> phy_blocks.back() -> mapped_blocks[0].block;
+          // GMLAKE_INFO("sblock %p, is %lu, free block: %lu, used block: %lu", p.block -> ptr, p.block -> allocated, p.block -> vmm_segment -> free_blocks, p.block -> vmm_segment -> used_blocks);
           // GMLAKE_INFO("last pBlock has been used in %lu sBlocks", last_block -> vmm_segment -> phy_blocks[0] -> mapped_blocks.size());
-          size_t last_block_size = last_block -> size;
+          // size_t last_block_size = last_block -> size;
           // GMLAKE_INFO("last pBlock size: %luMB", last_block -> size);
-          size_t last_block_offset = last_block -> vmm_segment -> phy_blocks.size();
+          // size_t last_block_offset = last_block -> vmm_segment -> phy_blocks.size();
           // GMLAKE_INFO("it's time to expansSegment");
+          // GMLAKE_INFO("phy_blocks is %lu", p.block->vmm_segment->phy_blocks.size());
+          // GMLAKE_INFO("vir_blocks is %lu", p.block->vmm_segment->vir_blocks.size());
           if (p.block -> vmm_segment -> expandSegment(expandable_size)) {
 
-            GMLAKE_INFO("TJB has a %luMB block, has expanded %luMB, and want %luMB", p.block -> size/(1024*1024), expandable_size/(1024*1024), p.search_key.size/(1024*1024));
+            GMLAKE_INFO("TJB has a %luMB block, has expanded %luMB, and want %luMB, block_ptr %p", p.block -> size/(1024*1024), expandable_size/(1024*1024), p.search_key.size/(1024*1024), p.block->ptr);
 
             int64_t net_change_inactive_split_blocks = 0;
             int64_t net_change_inactive_split_size = 0;  
@@ -2865,37 +2868,156 @@ class DeviceCachingAllocator {
             //更新刚增加的物理块的信息
             total_fuse_size += aligned_expandable_size;
             // GMLAKE_INFO("total_fused_size: %luMB", total_fuse_size / 1024 / 1024);
+            std::vector<std::shared_ptr<PhyBlock>> phy_blocks2create;
+            std::vector<std::shared_ptr<VirBlock>> vir_blocks2create;
+            void* ptr;
+            
+            // GMLAKE_INFO("phy_blocks is %lu", p.block->vmm_segment->phy_blocks.size());
+            // GMLAKE_INFO("vir_blocks is %lu", p.block->vmm_segment->vir_blocks.size());
 
             //先将增加的单位物理块放到最后一个pBlock中，更新pBlock和sBlock的大小信息
             for (size_t i = old_phy_blocks_size; i < p.block -> vmm_segment -> phy_blocks.size(); i++) {
-              last_block -> vmm_segment -> phy_blocks.push_back(p.block -> vmm_segment -> phy_blocks[i]);
-              last_block -> vmm_segment -> vir_blocks.push_back(p.block -> vmm_segment -> vir_blocks[i]);
-              p.block -> vmm_segment -> phy_blocks[i] -> mapped_blocks.emplace_back(last_block, last_block_offset);
-              p.block -> vmm_segment -> phy_blocks[i] -> free = true;
-              last_block_offset++;
-              p.block -> vmm_segment -> phy_blocks[i] -> mapped_blocks.emplace_back(p.block, i);
+              auto& phy_block = p.block->vmm_segment->phy_blocks[i];
+              auto& vir_block = p.block->vmm_segment->vir_blocks[i];
+              // GMLAKE_INFO("phy %lu", phy_block -> block_size);
+              // GMLAKE_INFO("vir%lu", vir_block -> block_ptr);
+              phy_blocks2create.push_back(phy_block);
+              vir_blocks2create.push_back(vir_block);
+              // last_block -> vmm_segment -> phy_blocks.push_back(p.block -> vmm_segment -> phy_blocks[i]);
+              // last_block -> vmm_segment -> vir_blocks.push_back(p.block -> vmm_segment -> vir_blocks[i]);
+              // p.block -> vmm_segment -> phy_blocks[i] -> mapped_blocks.emplace_back(last_block, last_block_offset);
+              // last_block_offset++;
+              // p.block -> vmm_segment -> phy_blocks[i] -> mapped_blocks.emplace_back(p.block, i);
             }
-            large_blocks.blocks.erase(last_block);
-            last_block -> vmm_segment -> free_blocks = 0;
-            last_block -> allocated = true;                                                                    //在改变last_block的比较size之前，先把它移除。
-            update_stat_array(stats.active, 1, p.stat_types);
-            last_block -> vmm_segment -> free_blocks = last_block -> vmm_segment -> phy_blocks.size();
-            p.block -> vmm_segment -> free_blocks = p.block -> vmm_segment -> phy_blocks.size();
-            last_block -> size = last_block -> vmm_segment -> phy_blocks.size() * kGranularity;
-            p.block -> size = p.block -> vmm_segment -> phy_blocks.size() * kGranularity;
-            
-            update_stat_array(stats.active_bytes, last_block -> size, p.stat_types);
-            active_blocks.insert(last_block);
-            //更新状态相关的信息
-            for_each_selected_stat_type(p.stat_types, [&](size_t stat_type){
-              update_stat(stats.reserved_bytes[stat_type], aligned_expandable_size);
-            });
-            if(last_block->size >= CachingAllocatorConfig::max_split_size() && last_block_size < CachingAllocatorConfig::max_split_size())
-              update_stat(stats.oversize_segments, 1);
 
-            TORCH_INTERNAL_ASSERT(last_block != nullptr && last_block -> ptr != nullptr);
+            std::shared_ptr<VmmSegment> vmm_segment;
+
+            phy_blocks2create.resize(p.block->vmm_segment->phy_blocks.size() - old_phy_blocks_size);
+            vir_blocks2create.resize(p.block->vmm_segment->phy_blocks.size() - old_phy_blocks_size);
+
+            // // 检查每个指针是否有效
+            // for (const auto& ptr : phy_blocks2create) {
+            //     if (!ptr) {
+            //         GMLAKE_INFO("Error: Invalid physical block pointer");
+            //         return false;
+            //     }
+            // }
+            // int i = 0;
+            // for (const auto& ptr : vir_blocks2create) {
+                
+            //     if (!ptr) {
+            //         GMLAKE_INFO("Error: Invalid virtual block pointer and is %lu", i);
+            //         return false;
+            //     }
+            //     i ++;
+            // }
+
+            int gc_time = 0;
+            do
+            {
+              // GMLAKE_INFO("gc_time %lu", gc_time);
+              // GMLAKE_INFO("aaa");
+              // GMLAKE_INFO("block_size: %lu", phy_blocks2create[0] -> block_size);
+              // GMLAKE_INFO("block_ptr: %lu", vir_blocks2create[0]);
+              vmm_segment = std::make_shared<VmmSegment>(phy_blocks2create, vir_blocks2create);
+              // GMLAKE_INFO(" 5");
+
+              if(vmm_segment->status == CUDA_SUCCESS && vmm_segment->segment_ptr) {
+                GMLAKE_INFO("vmmsegment create success");
+                break;
+              } else {
+                cudaGetLastError();
+                                
+                size_t device_free;
+                size_t device_total;
+                cudaMemGetInfo(&device_free, &device_total);
+                                
+                size_t total_garbage_size = fragmented_free_fused_blocks[p.stream()].pool_size + free_fused_blocks_in_release_order[p.stream()].pool_size;
+                      
+                        
+                if(device_free > aligned_expandable_size && total_garbage_size >= aligned_expandable_size) {
+                  GMLAKE_INFO(" allocate size %luMB memory by vmm the %dth time failed, try to garbage_collect_fused_blocks", aligned_expandable_size/(1024*1024), gc_time);
+                            
+                  vmm_segment.reset();
+                  size_t garbage_size = garbage_collect_fused_blocks(gc_time, p.alloc_size);
+                  total_fuse_size -= garbage_size;
+                            
+                  gc_time++;
+                          
+                  cudaGetLastError();
+                } else {
+                  break;
+                }
+              }
+            } while(gc_time < 3);
+
+            if(!vmm_segment || vmm_segment->status != CUDA_SUCCESS || !vmm_segment->segment_ptr) {           
+              p.err = cudaErrorMemoryAllocation;
+              cudaGetLastError();
+              vmm_segment.reset();
+                    
+              GMLAKE_INFO(" allocate size %fMB memory by vmm failed", aligned_expandable_size/(1024.f*1024.f));
+                
+              return false;
+            }
+
+            ptr = vmm_segment -> segment_ptr;
+
+            if (p.pool->owner_PrivatePool) {
+              // The block is for a CUDA graph's PrivatePool.
+              p.pool->owner_PrivatePool->cudaMalloc_count++;
+            }
             
             total_allocated_memory += aligned_expandable_size;
+            Block* new_block = new Block(p.device(), p.stream(), aligned_expandable_size, p.pool, (char*)ptr);
+            new_block->vmm_segment = std::move(vmm_segment);
+
+            for_each_selected_stat_type(p.stat_types, [&](size_t stat_type) {
+              update_stat(stats.segment[stat_type], 1);
+              update_stat(stats.reserved_bytes[stat_type], aligned_expandable_size);
+            });
+            if (aligned_expandable_size >= CachingAllocatorConfig::max_split_size())
+              update_stat(stats.oversize_segments, 1);
+
+            TORCH_INTERNAL_ASSERT(new_block != nullptr && new_block->ptr != nullptr);
+
+            for (size_t i = 0; i < new_block -> vmm_segment -> phy_blocks.size(); i ++, old_phy_blocks_size ++){
+              new_block->vmm_segment->phy_blocks[i]->mapped_blocks.emplace_back(new_block, i);
+              new_block->vmm_segment->phy_blocks[i]->mapped_blocks.emplace_back(p.block, old_phy_blocks_size);
+              new_block->vmm_segment->phy_blocks[i]->free = true;
+            }
+
+            new_block->vmm_segment->free_blocks = new_block->vmm_segment->phy_blocks.size();
+            new_block->vmm_segment->used_blocks = 0;
+
+            large_blocks.blocks.insert(new_block);
+
+            // large_blocks.blocks.erase(last_block);
+            free_fused_blocks.blocks.erase(p.block);
+            free_fused_blocks_in_release_order[p.block -> stream].erase(p.block);
+            // last_block -> allocated = false;                                                                    //在改变last_block的比较size之前，先把它移除。
+            // update_stat_array(stats.active, 1, p.stat_types);
+            // last_block -> vmm_segment -> free_blocks = last_block -> vmm_segment -> phy_blocks.size();
+            p.block -> vmm_segment -> free_blocks = p.block -> vmm_segment -> phy_blocks.size();
+            p.block -> vmm_segment -> used_blocks = 0;
+            // last_block -> size = last_block -> vmm_segment -> phy_blocks.size() * kGranularity;
+            p.block -> size = p.block -> vmm_segment -> phy_blocks.size() * kGranularity;
+            
+            // large_blocks.blocks.insert(last_block);
+            free_fused_blocks.blocks.insert(p.block);
+            free_fused_blocks_in_release_order[p.block -> stream].insert(p.block);
+
+            // update_stat_array(stats.active_bytes, last_block -> size, p.stat_types);
+            // active_blocks.insert(last_block);
+            //更新状态相关的信息
+            // for_each_selected_stat_type(p.stat_types, [&](size_t stat_type){
+            //   update_stat(stats.reserved_bytes[stat_type], aligned_expandable_size);
+            // });
+            // if(last_block->size >= CachingAllocatorConfig::max_split_size() && last_block_size < CachingAllocatorConfig::max_split_size())
+            //   update_stat(stats.oversize_segments, 1);
+
+            // TORCH_INTERNAL_ASSERT(last_block != nullptr && last_block -> ptr != nullptr);
+            
             //接下来就是正常的sBlock分配逻辑，而且这里的sBlock一定不用分割，因为就是根据大小创建的
             for (size_t i = 0; i < p.block -> vmm_segment -> phy_blocks.size(); i++) {
               auto& phy_block = p.block -> vmm_segment -> phy_blocks[i];
@@ -2910,7 +3032,6 @@ class DeviceCachingAllocator {
                 Block* other_block = block_segment.block;
 
                 if(other_block == p.block) continue;
-                if(other_block == last_block) continue;
 
                 if(other_block -> vmm_segment -> fused) {
                   if(other_block -> vmm_segment -> free_blocks == other_block -> vmm_segment -> phy_blocks.size() &&
@@ -2965,6 +3086,7 @@ class DeviceCachingAllocator {
             update_stat_array(stats.inactive_split_bytes, net_change_inactive_split_size, p.stat_types);
 
             GMLAKE_INFO("has distribute expandable block");
+            GMLAKE_INFO("free_blocks is %lu, used_blocks is %lu", p.block->vmm_segment->free_blocks, p.block->vmm_segment->used_blocks);
             return true;
           }
         }

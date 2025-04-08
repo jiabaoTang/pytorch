@@ -433,6 +433,21 @@ struct VmmSegment {
                                                                         fused(false),
                                                                         released(false)
                                                                         {}
+    // VmmSegment(std::vector<std::shared_ptr<PhyBlock>> phy_blocks_in, 
+    //            std::vector<std::shared_ptr<VirBlock>> vir_blocks_in,
+    //            int n):                                                  phy_blocks(phy_blocks_in), 
+    //                                                                     vir_blocks(vir_blocks_in), 
+    //                                                                     granul_size(phy_blocks[0]->block_size), 
+    //                                                                     segment_ptr(vir_blocks[0]->block_ptr),
+    //                                                                     device_id(phy_blocks[0]->device_id), 
+    //                                                                     status(CUDA_SUCCESS),
+    //                                                                     free_blocks(phy_blocks.size()),
+    //                                                                     used_blocks(0),
+    //                                                                     fused(false),
+    //                                                                     released(false)
+    //                                                                     {
+    //                                                                         if (n == 1) GMLAKE_INFO("TJB in create")
+    //                                                                     }
 
     
     void allocate_phy_blocks(size_t blocks, size_t block_size_in, int device_id_in) {
@@ -605,7 +620,7 @@ struct VmmSegment {
         {
             std::lock_guard<std::mutex> lock(expand_mutex);
 
-            vir_blocks.resize(phy_blocks.size());
+            vir_blocks.reserve(phy_blocks.size());
 
             size_t current_offset = current_size;
             for (size_t j = current_blocks; j < phy_blocks.size(); j++) {
